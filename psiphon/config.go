@@ -714,6 +714,33 @@ type Config struct {
 	// proxy or proxies with the same personal compartment ID.
 	InproxyClientPersonalCompartmentID string `json:",omitempty"`
 
+	// InproxyRejectProxyCountryCodes specifies a list of country codes (ISO
+	// 3166-1 alpha-2, e.g., "IR", "CN") for which in-proxy connections should
+	// be rejected. If the matched proxy's country code is in this list, the
+	// client will reject the connection and request a different proxy.
+	// This is useful to avoid connecting through proxies in regions where
+	// proxy traffic may be monitored or unreliable.
+	//
+	// Requires GeoIPDatabasePath to be set. If GeoIPDatabasePath is not
+	// configured, this setting is ignored and InproxyRejectProxyCIDRs should
+	// be used instead.
+	InproxyRejectProxyCountryCodes []string `json:",omitempty"`
+
+	// GeoIPDatabasePath specifies the path to a MaxMind GeoLite2-Country or
+	// GeoIP2-Country database file (.mmdb format). This database is used for
+	// client-side GeoIP lookups, such as determining the country of in-proxy
+	// proxies when InproxyRejectProxyCountryCodes is configured.
+	//
+	// The database can be obtained from MaxMind (requires free registration):
+	// https://dev.maxmind.com/geoip/geolite2-free-geolocation-data
+	GeoIPDatabasePath string `json:",omitempty"`
+
+	// InproxyRejectProxyCIDRs specifies a list of CIDR ranges (e.g.,
+	// "185.143.232.0/22") for which in-proxy connections should be rejected.
+	// If the matched proxy's IP address falls within any of these ranges,
+	// the client will reject the connection and request a different proxy.
+	InproxyRejectProxyCIDRs []string `json:",omitempty"`
+
 	// InproxyPersonalPairingConnectionWorkerPoolSize specifies the value for
 	// ConnectionWorkerPoolSize in personal pairing mode. If omitted or when
 	// 0, a default is used; this is recommended.

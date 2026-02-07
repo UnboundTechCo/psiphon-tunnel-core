@@ -118,6 +118,20 @@ type ClientConfig struct {
 	// in-proxy-only personal pairing mode, as other tunnel protocols remain
 	// available.
 	MustUpgrade func()
+
+	// RejectProxyIP is a callback that is invoked after the WebRTC connection
+	// to the proxy is established, to check if the proxy's IP address should
+	// be rejected. If the callback returns true, the connection will be closed
+	// and the dial will be retried with a different proxy.
+	//
+	// This can be used to reject proxies from certain countries or IP ranges.
+	// The callback receives the proxy's remote IP address.
+	RejectProxyIP func(proxyIP net.IP) bool
+
+	// OnProxyConnected is a callback that is invoked when a proxy connection
+	// is successfully established and accepted (not rejected). This can be used
+	// for logging or metrics. The callback receives the proxy's remote IP address.
+	OnProxyConnected func(proxyIP net.IP)
 }
 
 // DialClient establishes an in-proxy connection for relaying traffic to the
@@ -239,6 +253,33 @@ func DialClient(
 		result, retry, err = dialClientWebRTCConn(ctx, config)
 		if err == nil {
 
+			// Check if the proxy IP should be rejected
+			if config.RejectProxyIP != nil && result.conn != nil {
+				proxyIP := result.conn.GetRemoteProxyIP()
+				if proxyIP != nil && config.RejectProxyIP(proxyIP) {
+					config.Logger.WithTraceFields(common.LogFields{
+						"proxy_ip": proxyIP.String(),
+					}).Warning("rejecting proxy due to excluded IP")
+					result.conn.Close()
+					lastErr = errors.TraceNew("proxy IP rejected")
+					// Retry with a different proxy
+					brokerCoordinator := config.BrokerClient.GetBrokerDialCoordinator()
+					common.SleepWithJitter(
+						ctx,
+						common.ValueOrDefault(brokerCoordinator.OfferRetryDelay(), clientOfferRetryDelay),
+						common.ValueOrDefault(brokerCoordinator.OfferRetryJitter(), clientOfferRetryJitter))
+					continue
+				}
+			}
+
+			// Notify that a proxy connection was accepted
+			if config.OnProxyConnected != nil && result.conn != nil {
+				proxyIP := result.conn.GetRemoteProxyIP()
+				if proxyIP != nil {
+					config.OnProxyConnected(proxyIP)
+				}
+			}
+
 			if attempt > 0 {
 				// Record the time elapsed in previous attempts.
 				metrics["inproxy_dial_failed_attempts_duration"] =
@@ -288,6 +329,14 @@ func DialClient(
 // include with its Psiphon handshake parameters.
 func (conn *ClientConn) GetConnectionID() ID {
 	return conn.connectionID
+}
+
+// GetRemoteProxyIP returns the IP address of the remote proxy.
+func (conn *ClientConn) GetRemoteProxyIP() net.IP {
+	if conn.webRTCConn != nil {
+		return conn.webRTCConn.GetRemoteProxyIP()
+	}
+	return nil
 }
 
 // InitialRelayPacket returns the initial packet in the broker->server

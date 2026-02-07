@@ -1615,6 +1615,8 @@ func dialInproxy(
 		RemoteAddrOverride:           remoteAddrOverride,
 		PackedDestinationServerEntry: dialParams.inproxyPackedSignedServerEntry,
 		MustUpgrade:                  config.OnInproxyMustUpgrade,
+		RejectProxyIP:                makeRejectProxyIPCallback(config),
+		OnProxyConnected:             makeOnProxyConnectedCallback(config),
 	}
 
 	conn, err := inproxy.DialClient(ctx, clientConfig)
@@ -1627,6 +1629,78 @@ func dialInproxy(
 	dialParams.inproxyConn.Store(conn)
 
 	return conn, nil
+}
+
+// makeRejectProxyIPCallback creates a callback function that checks if a proxy
+// IP address should be rejected based on:
+// 1. InproxyRejectProxyCountryCodes - country codes using GeoIP lookup (requires GeoIPDatabasePath)
+// 2. InproxyRejectProxyCIDRs - explicit CIDR ranges
+//
+// Returns nil if neither are configured.
+func makeRejectProxyIPCallback(config *Config) func(net.IP) bool {
+	hasCountryCodes := len(config.InproxyRejectProxyCountryCodes) > 0 && IsGeoIPAvailable()
+	hasCIDRs := len(config.InproxyRejectProxyCIDRs) > 0
+
+	if !hasCountryCodes && !hasCIDRs {
+		return nil
+	}
+
+	// Build country code lookup set for O(1) lookups
+	var rejectCountries map[string]bool
+	if hasCountryCodes {
+		rejectCountries = make(map[string]bool)
+		for _, code := range config.InproxyRejectProxyCountryCodes {
+			rejectCountries[code] = true
+		}
+		NoticeInfo("configured to reject in-proxy proxies from countries: %v", config.InproxyRejectProxyCountryCodes)
+	}
+
+	// Build CIDR subnet lookup
+	var rejectSubnets common.SubnetLookup
+	if hasCIDRs {
+		var err error
+		rejectSubnets, err = common.NewSubnetLookup(config.InproxyRejectProxyCIDRs)
+		if err != nil {
+			NoticeWarning("failed to create reject proxy subnet lookup: %v", err)
+			rejectSubnets = nil
+		}
+	}
+
+	return func(proxyIP net.IP) bool {
+		// Check country code first (if available)
+		if rejectCountries != nil {
+			country := LookupIPCountry(proxyIP)
+			if country != "" && rejectCountries[country] {
+				NoticeWarning("rejecting in-proxy from country %s (IP: %s)", country, proxyIP.String())
+				return true
+			}
+		}
+
+		// Check CIDR ranges
+		if rejectSubnets != nil && rejectSubnets.ContainsIPAddress(proxyIP) {
+			NoticeWarning("rejecting in-proxy from excluded CIDR range (IP: %s)", proxyIP.String())
+			return true
+		}
+
+		return false
+	}
+}
+
+// makeOnProxyConnectedCallback creates a callback function that logs when
+// a Conduit proxy connection is successfully established. It logs the proxy's
+// IP address and country (if GeoIP is available).
+func makeOnProxyConnectedCallback(config *Config) func(net.IP) {
+	return func(proxyIP net.IP) {
+		country := ""
+		if IsGeoIPAvailable() {
+			country = LookupIPCountry(proxyIP)
+		}
+		if country != "" {
+			NoticeInfo("trying Conduit relay (country: %s)", country)
+		} else {
+			NoticeInfo("trying Conduit relay")
+		}
+	}
 }
 
 // Fields are exported for JSON encoding in NoticeLivenessTest.

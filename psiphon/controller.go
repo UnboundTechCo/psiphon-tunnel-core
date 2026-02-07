@@ -314,6 +314,15 @@ func (controller *Controller) Run(ctx context.Context) {
 
 	pprofRun()
 
+	// Initialize GeoIP database if configured. This enables country-based
+	// filtering of in-proxy proxies via InproxyRejectProxyCountryCodes.
+	if controller.config.GeoIPDatabasePath != "" {
+		if err := InitGeoIP(controller.config.GeoIPDatabasePath); err != nil {
+			NoticeWarning("failed to initialize GeoIP database: %v", err)
+		}
+	}
+	defer CloseGeoIP()
+
 	// Ensure fresh repetitive notice state for each run, so the
 	// client will always get an AvailableEgressRegions notice,
 	// an initial instance of any repetitive error notice, etc.
@@ -1179,6 +1188,29 @@ loop:
 				connectedTunnel.dialParams.TunnelProtocol)
 
 			NoticeConnectedServerRegion(connectedTunnel.dialParams.ServerEntry.Region)
+
+			// Emit notice for Conduit proxy country when using inproxy protocols
+			if protocol.TunnelProtocolUsesInproxy(connectedTunnel.dialParams.TunnelProtocol) {
+				if conn := connectedTunnel.dialParams.inproxyConn.Load(); conn != nil {
+					if clientConn, ok := conn.(*inproxy.ClientConn); ok && clientConn != nil {
+						proxyIP := clientConn.GetRemoteProxyIP()
+						if proxyIP != nil {
+							country := ""
+							if IsGeoIPAvailable() {
+								country = LookupIPCountry(proxyIP)
+							}
+							if country != "" {
+								NoticeInfo("tunnel connected via Conduit relay (protocol: %s, country: %s)", connectedTunnel.dialParams.TunnelProtocol, country)
+							} else {
+								NoticeInfo("tunnel connected via Conduit relay (protocol: %s)", connectedTunnel.dialParams.TunnelProtocol)
+							}
+						}
+					}
+				}
+			} else {
+				// Emit notice for non-Conduit protocols
+				NoticeInfo("tunnel connected (protocol: %s)", connectedTunnel.dialParams.TunnelProtocol)
+			}
 
 			if isFirstTunnel {
 

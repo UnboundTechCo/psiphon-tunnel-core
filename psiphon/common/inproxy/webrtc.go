@@ -112,6 +112,7 @@ type webRTCConn struct {
 	receiveMediaTrackOpenedSignal chan struct{}
 	mediaTrackReliabilityLayer    *reliableConn
 	iceCandidatePairMetrics       common.LogFields
+	remoteProxyIP                 net.IP
 
 	readMutex               sync.Mutex
 	readBuffer              []byte
@@ -1310,6 +1311,7 @@ func (conn *webRTCConn) recordSelectedICECandidateStats() error {
 		conn.iceCandidatePairMetrics["inproxy_webrtc_remote_ice_candidate_type"] =
 			logCandidateType(remoteCandidateStats.CandidateType)
 		remoteIP := net.ParseIP(remoteCandidateStats.IP)
+		conn.remoteProxyIP = remoteIP
 		isIPv6 = "0"
 		if remoteIP != nil && remoteIP.To4() == nil {
 			isIPv6 = "1"
@@ -1456,6 +1458,14 @@ func (conn *webRTCConn) RemoteAddr() net.Addr {
 
 	// Not supported.
 	return nil
+}
+
+// GetRemoteProxyIP returns the remote proxy's IP address extracted from the
+// selected ICE candidate pair after the connection is established.
+func (conn *webRTCConn) GetRemoteProxyIP() net.IP {
+	conn.mutex.Lock()
+	defer conn.mutex.Unlock()
+	return conn.remoteProxyIP
 }
 
 func (conn *webRTCConn) SetDeadline(t time.Time) error {
