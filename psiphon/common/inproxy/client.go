@@ -215,8 +215,10 @@ func DialClient(
 
 		duration := time.Since(startTime)
 		metrics["inproxy_dial_nat_discovery_duration"] = fmt.Sprintf("%d", duration/time.Millisecond)
-		config.Logger.WithTraceFields(
-			common.LogFields{"duration": duration.String()}).Info("NAT discovery complete")
+		config.Logger.WithTraceFields(common.LogFields{
+			"duration": duration.String(),
+			"natType":  config.WebRTCDialCoordinator.NATType().String(),
+		}).Info("inproxy-dial: NAT discovery OK")
 		startTime = time.Now()
 	}
 
@@ -226,6 +228,10 @@ func DialClient(
 	for attempt := 0; ; attempt += 1 {
 
 		previousAttemptsDuration := time.Since(startTime)
+
+		config.Logger.WithTraceFields(common.LogFields{
+			"attempt": attempt + 1,
+		}).Info("inproxy-dial: attempt starting")
 
 		// Repeatedly try to establish in-proxy/WebRTC connection until the
 		// dial context is canceled or times out.
@@ -246,12 +252,20 @@ func DialClient(
 				err = fmt.Errorf(
 					"%w, attempts: %d, lastErr: %w", err, attempt, lastErr)
 			}
+			config.Logger.WithTraceFields(common.LogFields{
+				"attempt": attempt + 1,
+				"error":   err.Error(),
+			}).Info("inproxy-dial: dial context done")
 			return nil, errors.Trace(err)
 		}
 
 		var retry bool
 		result, retry, err = dialClientWebRTCConn(ctx, config)
 		if err == nil {
+
+			config.Logger.WithTraceFields(common.LogFields{
+				"attempt": attempt + 1,
+			}).Info("inproxy-dial: attempt connected")
 
 			// Check if the proxy IP should be rejected
 			if config.RejectProxyIP != nil && result.conn != nil {
@@ -295,6 +309,11 @@ func DialClient(
 		lastErr = err
 
 		if retry {
+			config.Logger.WithTraceFields(common.LogFields{
+				"attempt": attempt + 1,
+				"error":   err.Error(),
+			}).Info("inproxy-dial: attempt failed (will retry)")
+
 			config.Logger.WithTraceFields(common.LogFields{"error": err}).Warning("dial failed")
 
 			// This delay is intended avoid overloading the broker with
@@ -309,6 +328,11 @@ func DialClient(
 
 			continue
 		}
+
+		config.Logger.WithTraceFields(common.LogFields{
+			"attempt": attempt + 1,
+			"error":   err.Error(),
+		}).Info("inproxy-dial: attempt failed (no retry)")
 
 		return nil, errors.Trace(err)
 	}
@@ -438,6 +462,11 @@ func dialClientWebRTCConn(
 		},
 		hasPersonalCompartmentIDs)
 	if err != nil {
+		duration := time.Since(startTime)
+		config.Logger.WithTraceFields(common.LogFields{
+			"duration": duration.String(),
+			"error":    err.Error(),
+		}).Info("inproxy-dial: ICE gathering FAILED")
 		return nil, true, errors.Trace(err)
 	}
 	defer func() {
@@ -450,7 +479,7 @@ func dialClientWebRTCConn(
 	duration := time.Since(startTime)
 	metrics["inproxy_dial_webrtc_ice_gathering_duration"] = fmt.Sprintf("%d", duration/time.Millisecond)
 	config.Logger.WithTraceFields(
-		common.LogFields{"duration": duration.String()}).Info("ICE gathering complete")
+		common.LogFields{"duration": duration.String()}).Info("inproxy-dial: ICE gathering OK")
 	startTime = time.Now()
 
 	// Send the ClientOffer request to the broker
@@ -494,20 +523,26 @@ func dialClientWebRTCConn(
 		},
 		hasPersonalCompartmentIDs)
 	if err != nil {
+		duration = time.Since(startTime)
+		config.Logger.WithTraceFields(common.LogFields{
+			"duration": duration.String(),
+			"error":    err.Error(),
+		}).Info("inproxy-dial: broker offer FAILED")
 		return nil, false, errors.Trace(err)
 	}
 
 	duration = time.Since(startTime)
 	metrics["inproxy_dial_broker_offer_duration"] = fmt.Sprintf("%d", duration/time.Millisecond)
-	config.Logger.WithTraceFields(
-		common.LogFields{"duration": duration.String()}).Info("Broker offer complete")
-	startTime = time.Now()
 
 	// MustUpgrade has precedence over other cases to ensure the callback is
 	// invoked. No retry when rate/entry limited or must upgrade; do retry on
 	// no-match, as a match may soon appear.
 
 	if offerResponse.MustUpgrade {
+
+		config.Logger.WithTraceFields(common.LogFields{
+			"duration": duration.String(),
+		}).Info("inproxy-dial: broker offer MUST_UPGRADE")
 
 		if config.MustUpgrade != nil {
 			config.MustUpgrade()
@@ -523,12 +558,25 @@ func dialClientWebRTCConn(
 		// having existing clients abort the in-proxy dial without discarding
 		// the broker client.
 
+		config.Logger.WithTraceFields(common.LogFields{
+			"duration": duration.String(),
+		}).Info("inproxy-dial: broker offer LIMITED")
+
 		return nil, false, errors.TraceNew("limited")
 
 	} else if offerResponse.NoMatch {
 
+		config.Logger.WithTraceFields(common.LogFields{
+			"duration": duration.String(),
+		}).Info("inproxy-dial: broker offer NO_MATCH")
+
 		return nil, true, errors.TraceNew("no match")
 	}
+
+	config.Logger.WithTraceFields(common.LogFields{
+		"duration": duration.String(),
+	}).Info("inproxy-dial: broker offer MATCHED")
+	startTime = time.Now()
 
 	if offerResponse.SelectedProtocolVersion < ProtocolVersion1 ||
 		(useMediaStreams &&
@@ -544,24 +592,34 @@ func dialClientWebRTCConn(
 	err = webRTCConn.SetRemoteSDP(
 		offerResponse.ProxyAnswerSDP, hasPersonalCompartmentIDs)
 	if err != nil {
+		config.Logger.WithTraceFields(common.LogFields{
+			"error": err.Error(),
+		}).Info("inproxy-dial: SetRemoteSDP FAILED")
 		return nil, true, errors.Trace(err)
 	}
 
+	awaitReadyToProxyTimeout := common.ValueOrDefault(
+		config.WebRTCDialCoordinator.WebRTCAwaitReadyToProxyTimeout(), readyToProxyAwaitTimeout)
+
 	awaitReadyToProxyCtx, awaitReadyToProxyCancelFunc := context.WithTimeout(
-		ctx,
-		common.ValueOrDefault(
-			config.WebRTCDialCoordinator.WebRTCAwaitReadyToProxyTimeout(), readyToProxyAwaitTimeout))
+		ctx, awaitReadyToProxyTimeout)
 	defer awaitReadyToProxyCancelFunc()
 
 	err = webRTCConn.AwaitReadyToProxy(awaitReadyToProxyCtx, offerResponse.ConnectionID)
 	if err != nil {
+		duration = time.Since(startTime)
+		config.Logger.WithTraceFields(common.LogFields{
+			"duration": duration.String(),
+			"timeout":  awaitReadyToProxyTimeout.String(),
+			"error":    err.Error(),
+		}).Info("inproxy-dial: WebRTC connect FAILED")
 		return nil, true, errors.Trace(err)
 	}
 
 	duration = time.Since(startTime)
 	metrics["inproxy_dial_webrtc_connection_duration"] = fmt.Sprintf("%d", duration/time.Millisecond)
 	config.Logger.WithTraceFields(
-		common.LogFields{"duration": duration.String()}).Info("WebRTC connection complete")
+		common.LogFields{"duration": duration.String()}).Info("inproxy-dial: WebRTC connect OK")
 
 	return &clientWebRTCDialResult{
 		conn:         webRTCConn,
