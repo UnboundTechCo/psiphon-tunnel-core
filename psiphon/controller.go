@@ -81,6 +81,7 @@ type Controller struct {
 	stopEstablish                           context.CancelFunc
 	establishWaitGroup                      *sync.WaitGroup
 	establishedTunnelsCount                 int32
+	establishUniqueServerCount              int
 	candidateServerEntries                  chan *candidateServerEntry
 	untunneledDialConfig                    *DialConfig
 	untunneledSplitTunnelClassifications    *lrucache.Cache
@@ -1129,6 +1130,15 @@ loop:
 			isFirstTunnel := (active == 0)
 			isLastTunnel := (outstanding == 1)
 
+			// Capture beast mode stats before stopEstablishing resets counters
+			var beastModeAttempts, beastModeServers int
+			if controller.config.AggressiveEstablishment && isLastTunnel {
+				controller.concurrentEstablishTunnelsMutex.Lock()
+				beastModeAttempts = controller.establishConnectTunnelCount
+				beastModeServers = controller.establishUniqueServerCount
+				controller.concurrentEstablishTunnelsMutex.Unlock()
+			}
+
 			if !discardTunnel {
 
 				if isLastTunnel {
@@ -1210,6 +1220,11 @@ loop:
 			} else {
 				// Emit notice for non-Conduit protocols
 				NoticeInfo("tunnel connected (protocol: %s)", connectedTunnel.dialParams.TunnelProtocol)
+			}
+
+			// Emit beast mode stats when aggressive establishment is active
+			if controller.config.AggressiveEstablishment {
+				NoticeInfo("beast mode connected (attempts: %d, servers: %d)", beastModeAttempts, beastModeServers)
 			}
 
 			if isFirstTunnel {
@@ -1892,6 +1907,11 @@ type candidateServerEntry struct {
 	serverEntry                *protocol.ServerEntry
 	isServerAffinityCandidate  bool
 	adjustedEstablishStartTime time.Time
+	// preSelectedProtocol, when set, forces this candidate to use the
+	// specified tunnel protocol instead of random selection. This is used
+	// in aggressive establishment mode where each server entry generates
+	// one candidate per supported protocol.
+	preSelectedProtocol string
 }
 
 // startEstablishing creates a pool of worker goroutines which will
@@ -1911,6 +1931,7 @@ func (controller *Controller) startEstablishing() {
 
 	controller.concurrentEstablishTunnelsMutex.Lock()
 	controller.establishConnectTunnelCount = 0
+	controller.establishUniqueServerCount = 0
 	controller.concurrentEstablishTunnels = 0
 	controller.concurrentIntensiveEstablishTunnels = 0
 	controller.peakConcurrentEstablishTunnels = 0
@@ -2165,6 +2186,17 @@ func (controller *Controller) launchEstablishing() {
 		workerPoolSize = p.Int(parameters.ConnectionWorkerPoolSize)
 	}
 
+	// In aggressive establishment mode, increase the worker pool size to
+	// handle the larger number of candidates (one per protocol per server).
+	// Use at least 30 workers, unless already set higher.
+	if controller.config.AggressiveEstablishment && workerPoolSize < 30 {
+		workerPoolSize = 30
+	}
+
+	if controller.config.AggressiveEstablishment {
+		NoticeInfo("beast mode active (workers: %d)", workerPoolSize)
+	}
+
 	// When TargetServerEntry is used, override any worker pool size config or
 	// tactic parameter and use a pool size of 1. The typical use case for
 	// TargetServerEntry is to test a specific server with a single connection
@@ -2394,6 +2426,7 @@ func (controller *Controller) stopEstablishing() {
 	peakConcurrent := controller.peakConcurrentEstablishTunnels
 	peakConcurrentIntensive := controller.peakConcurrentIntensiveEstablishTunnels
 	controller.establishConnectTunnelCount = 0
+	controller.establishUniqueServerCount = 0
 	controller.concurrentEstablishTunnels = 0
 	controller.concurrentIntensiveEstablishTunnels = 0
 	controller.peakConcurrentEstablishTunnels = 0
@@ -2558,6 +2591,12 @@ loop:
 
 			candidateServerEntryCount += 1
 
+			if controller.config.AggressiveEstablishment {
+				controller.concurrentEstablishTunnelsMutex.Lock()
+				controller.establishUniqueServerCount = candidateServerEntryCount
+				controller.concurrentEstablishTunnelsMutex.Unlock()
+			}
+
 			// adjustedEstablishStartTime is establishStartTime shifted
 			// to exclude time spent waiting for network connectivity.
 			adjustedEstablishStartTime := controller.establishStartTime.Add(
@@ -2575,13 +2614,35 @@ loop:
 			// closes the serverAffinityDoneBroadcast channel.
 			isServerAffinityCandidate = false
 
-			// TODO: here we could generate multiple candidates from the
-			// server entry when there are many MeekFrontingAddresses.
+			// In aggressive establishment mode, generate one candidate per
+			// supported protocol for each server entry. This ensures all
+			// server/protocol combinations are tried in a single round,
+			// dramatically reducing time-to-connect when few protocols work.
+			if controller.config.AggressiveEstablishment && !wasServerAffinityCandidate {
 
-			select {
-			case controller.candidateServerEntries <- candidate:
-			case <-controller.establishCtx.Done():
-				break loop
+				excludeIntensive := false
+				supportedProtocols := controller.protocolSelectionConstraints.supportedProtocols(
+					0, excludeIntensive, serverEntry)
+
+				for _, tunnelProtocol := range supportedProtocols {
+					aggressiveCandidate := &candidateServerEntry{
+						serverEntry:                serverEntry,
+						isServerAffinityCandidate:  false,
+						adjustedEstablishStartTime: adjustedEstablishStartTime,
+						preSelectedProtocol:        tunnelProtocol,
+					}
+					select {
+					case controller.candidateServerEntries <- aggressiveCandidate:
+					case <-controller.establishCtx.Done():
+						break loop
+					}
+				}
+			} else {
+				select {
+				case controller.candidateServerEntries <- candidate:
+				case <-controller.establishCtx.Done():
+					break loop
+				}
 			}
 
 			if time.Since(roundStartTime)-roundNetworkWaitDuration > workTime {
@@ -2928,6 +2989,12 @@ loop:
 
 		selectProtocol := func(
 			serverEntry *protocol.ServerEntry) (string, bool) {
+
+			// In aggressive establishment mode, the candidate already has a
+			// pre-selected protocol; use it directly.
+			if candidateServerEntry.preSelectedProtocol != "" {
+				return candidateServerEntry.preSelectedProtocol, true
+			}
 
 			preferInproxy := inproxyForceSelection || prng.FlipWeightedCoin(inproxyPreferProbability)
 

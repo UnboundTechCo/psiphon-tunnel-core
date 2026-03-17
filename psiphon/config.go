@@ -236,6 +236,16 @@ type Config struct {
 	// affinity server is the server used for the last established tunnel.
 	EstablishTunnelServerAffinityGracePeriodMilliseconds *int `json:",omitempty"`
 
+	// AggressiveEstablishment enables aggressive tunnel establishment mode.
+	// When enabled, each server entry generates one connection candidate per
+	// supported protocol (instead of one candidate with a randomly selected
+	// protocol). This ensures all server/protocol combinations are tried in
+	// a single round, significantly reducing time-to-connect in heavily
+	// censored environments where few protocols work. When enabled, the
+	// ConnectionWorkerPoolSize is also increased to handle the larger
+	// candidate set, unless already set to a higher value.
+	AggressiveEstablishment bool `json:",omitempty"`
+
 	// ConnectionWorkerPoolSize specifies how many connection attempts to
 	// attempt in parallel. If omitted or when 0, a default is used; this is
 	// recommended.
