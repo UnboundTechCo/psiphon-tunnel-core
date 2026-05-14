@@ -1170,7 +1170,7 @@ func getBaseAPIParameters(
 			}
 		}
 
-		params["relay_protocol"] = dialParams.TunnelProtocol
+		params["relay_protocol"] = protocol.TunnelProtocolBase(dialParams.TunnelProtocol)
 
 		if dialParams.BPFProgramName != "" {
 			params["client_bpf"] = dialParams.BPFProgramName

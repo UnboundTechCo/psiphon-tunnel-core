@@ -472,6 +472,8 @@ func GetCapability(protocol string) string {
 	// of "INPROXY-WEBRTC-OSSH", where a truncated "INPROXY-WEBRTC" is
 	// ambiguous.
 
+	protocol = TunnelProtocolBase(protocol)
+
 	if TunnelProtocolUsesInproxy(protocol) {
 		return protocol
 	}
@@ -618,6 +620,7 @@ type ConditionallyEnabledComponents interface {
 	QUICEnabled() bool
 	RefractionNetworkingEnabled() bool
 	InproxyEnabled() bool
+	FrontedMeekCDNEnabled() bool
 }
 
 // TunnelProtocolPortLists is a map from tunnel protocol names (or "All") to a
@@ -667,7 +670,10 @@ func (serverEntry *ServerEntry) GetSupportedProtocols(
 				!conditionallyEnabled.RefractionNetworkingEnabled()) ||
 
 			(TunnelProtocolUsesInproxy(tunnelProtocol) &&
-				!conditionallyEnabled.InproxyEnabled()) {
+				!conditionallyEnabled.InproxyEnabled()) ||
+
+			(TunnelProtocolUsesFrontedMeekCDN(tunnelProtocol) &&
+				!conditionallyEnabled.FrontedMeekCDNEnabled()) {
 			continue
 		}
 
@@ -736,7 +742,7 @@ func (serverEntry *ServerEntry) GetDialPortNumber(tunnelProtocol string) (int, e
 
 	if !TunnelProtocolUsesInproxy(tunnelProtocol) {
 
-		switch tunnelProtocol {
+		switch TunnelProtocolBase(tunnelProtocol) {
 
 		case TUNNEL_PROTOCOL_TLS_OBFUSCATED_SSH:
 			if serverEntry.TlsOSSHPort == 0 {
@@ -784,7 +790,7 @@ func (serverEntry *ServerEntry) GetDialPortNumber(tunnelProtocol string) (int, e
 		// used as an in-proxy 2nd hop, as the server will require a relayed
 		// in-proxy broker report for in-proxy 2nd hops.
 
-		switch TunnelProtocolMinusInproxy(tunnelProtocol) {
+		switch TunnelProtocolMinusInproxy(TunnelProtocolBase(tunnelProtocol)) {
 
 		case TUNNEL_PROTOCOL_TLS_OBFUSCATED_SSH:
 			if serverEntry.InproxyTlsOSSHPort == 0 {
@@ -942,6 +948,10 @@ func (serverEntry *ServerEntry) GetSupportedTacticsProtocols() []string {
 	for _, protocol := range SupportedTunnelProtocols {
 
 		if !TunnelProtocolUsesMeek(protocol) {
+			continue
+		}
+
+		if TunnelProtocolUsesFrontedMeekCDN(protocol) {
 			continue
 		}
 

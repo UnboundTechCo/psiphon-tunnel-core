@@ -209,6 +209,7 @@ func DoGarbageCollection() {
 // conditionallyEnabledComponents implements the
 // protocol.ConditionallyEnabledComponents interface.
 type conditionallyEnabledComponents struct {
+	frontedMeekCDNEnabled bool
 }
 
 func (c conditionallyEnabledComponents) QUICEnabled() bool {
@@ -221,6 +222,10 @@ func (c conditionallyEnabledComponents) RefractionNetworkingEnabled() bool {
 
 func (c conditionallyEnabledComponents) InproxyEnabled() bool {
 	return inproxy.Enabled()
+}
+
+func (c conditionallyEnabledComponents) FrontedMeekCDNEnabled() bool {
+	return c.frontedMeekCDNEnabled
 }
 
 // FileMigration represents the action of moving a file, or directory, to a new

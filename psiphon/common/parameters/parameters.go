@@ -328,6 +328,8 @@ const (
 	RestrictFrontingProviderIDs                        = "RestrictFrontingProviderIDs"
 	RestrictFrontingProviderIDsServerProbability       = "RestrictFrontingProviderIDsServerProbability"
 	RestrictFrontingProviderIDsClientProbability       = "RestrictFrontingProviderIDsClientProbability"
+	FrontedMeekDialOverrides                           = "FrontedMeekDialOverrides"
+	FrontedMeekDialOverridesProbability                = "FrontedMeekDialOverridesProbability"
 	HoldOffDirectTunnelMinDuration                     = "HoldOffDirectTunnelMinDuration"
 	HoldOffDirectTunnelMaxDuration                     = "HoldOffDirectTunnelMaxDuration"
 	HoldOffDirectTunnelProviderRegions                 = "HoldOffDirectTunnelProviderRegions"
@@ -931,6 +933,8 @@ var defaultParameters = map[string]struct {
 	RestrictFrontingProviderIDs:                  {value: []string{}},
 	RestrictFrontingProviderIDsServerProbability: {value: 0.0, minimum: 0.0, flags: serverSideOnly},
 	RestrictFrontingProviderIDsClientProbability: {value: 0.0, minimum: 0.0},
+	FrontedMeekDialOverrides:                     {value: FrontedMeekDialOverrideSpecs{}},
+	FrontedMeekDialOverridesProbability:          {value: 1.0, minimum: 0.0},
 
 	HoldOffDirectTunnelMinDuration:     {value: time.Duration(0), minimum: time.Duration(0)},
 	HoldOffDirectTunnelMaxDuration:     {value: time.Duration(0), minimum: time.Duration(0)},
@@ -1673,6 +1677,14 @@ func (p *Parameters) Set(
 					}
 					return nil, errors.Trace(err)
 				}
+			case FrontedMeekDialOverrideSpecs:
+				err := v.Validate(customTLSProfileNames)
+				if err != nil {
+					if skipOnError {
+						continue
+					}
+					return nil, errors.Trace(err)
+				}
 			case TunnelProtocolPortLists:
 				err := v.Validate()
 				if err != nil {
@@ -2290,6 +2302,32 @@ func (p ParametersAccessor) RegexStrings(name string) RegexStrings {
 // FrontingSpecs returns a FrontingSpecs parameter value.
 func (p ParametersAccessor) FrontingSpecs(name string) FrontingSpecs {
 	value := FrontingSpecs{}
+	p.snapshot.getValue(name, &value)
+	return value
+}
+
+// FrontedMeekDialOverrides returns a FrontedMeekDialOverrideSpecs parameter value.
+func (p ParametersAccessor) FrontedMeekDialOverrides(name string) FrontedMeekDialOverrideSpecs {
+
+	probabilityName := name + "Probability"
+	_, ok := p.snapshot.parameters[probabilityName]
+	if ok {
+		probabilityValue := float64(1.0)
+		p.snapshot.getValue(probabilityName, &probabilityValue)
+		if !prng.FlipWeightedCoin(probabilityValue) {
+			defaultParameter, ok := defaultParameters[name]
+			if ok {
+				defaultValue, ok := defaultParameter.value.(FrontedMeekDialOverrideSpecs)
+				if ok {
+					value := make(FrontedMeekDialOverrideSpecs, len(defaultValue))
+					copy(value, defaultValue)
+					return value
+				}
+			}
+		}
+	}
+
+	value := FrontedMeekDialOverrideSpecs{}
 	p.snapshot.getValue(name, &value)
 	return value
 }

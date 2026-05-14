@@ -75,6 +75,7 @@ type DialParameters struct {
 	ServerEntryIterationUniqueCandidateEstimate   int `json:"-"`
 	ServerEntryIterationMovedToFrontCount         int `json:"-"`
 	ServerEntryIterationFirstFrontedMeekCandidate int `json:"-"`
+	FrontedMeekCDNCandidateNumber                 int `json:"-"`
 
 	IsExchanged bool `json:",omitempty"`
 
@@ -110,16 +111,19 @@ type DialParameters struct {
 
 	FrontingProviderID string `json:",omitempty"`
 
-	MeekFrontingDialAddress   string       `json:",omitempty"`
-	MeekFrontingHost          string       `json:",omitempty"`
-	MeekDialAddress           string       `json:",omitempty"`
-	MeekTransformedHostName   bool         `json:",omitempty"`
-	MeekSNIServerName         string       `json:",omitempty"`
-	MeekVerifyServerName      string       `json:",omitempty"`
-	MeekVerifyPins            []string     `json:",omitempty"`
-	MeekHostHeader            string       `json:",omitempty"`
-	MeekObfuscatorPaddingSeed *prng.Seed   `json:",omitempty"`
-	MeekResolvedIPAddress     atomic.Value `json:"-"`
+	MeekFrontingDialAddress    string       `json:",omitempty"`
+	MeekFrontingHost           string       `json:",omitempty"`
+	MeekFrontingDialOverrideID string       `json:",omitempty"`
+	MeekDialAddress            string       `json:",omitempty"`
+	MeekTransformedHostName    bool         `json:",omitempty"`
+	MeekSNIServerName          string       `json:",omitempty"`
+	MeekVerifyServerName       string       `json:",omitempty"`
+	MeekVerifyServerNames      []string     `json:",omitempty"`
+	MeekVerifyPins             []string     `json:",omitempty"`
+	MeekTLSALPNProtocols       []string     `json:",omitempty"`
+	MeekHostHeader             string       `json:",omitempty"`
+	MeekObfuscatorPaddingSeed  *prng.Seed   `json:",omitempty"`
+	MeekResolvedIPAddress      atomic.Value `json:"-"`
 
 	TLSOSSHTransformedSNIServerName bool       `json:",omitempty"`
 	TLSOSSHSNIServerName            string     `json:",omitempty"`
@@ -226,7 +230,8 @@ func MakeDialParameters(
 	inproxyClientNATStateManager *InproxyNATStateManager,
 	isTactics bool,
 	candidateNumber int,
-	establishedTunnelsCount int) (*DialParameters, error) {
+	establishedTunnelsCount int,
+	frontedMeekCDNCandidateNumbers ...int) (*DialParameters, error) {
 
 	// Note: a subset of this code is duplicated in
 	// MakeInproxyBrokerDialParameters and makeFrontedHTTPClient, and all
@@ -238,6 +243,11 @@ func MakeDialParameters(
 	networkID := config.GetNetworkID()
 
 	p := config.GetParameters().Get()
+
+	frontedMeekCDNCandidateNumber := 0
+	if len(frontedMeekCDNCandidateNumbers) > 0 {
+		frontedMeekCDNCandidateNumber = frontedMeekCDNCandidateNumbers[0]
+	}
 
 	ttl := p.Duration(parameters.ReplayDialParametersTTL)
 	dslPlaceholderTTL := p.Duration(parameters.DSLPrioritizeDialPlaceholderTTL)
@@ -477,6 +487,7 @@ func MakeDialParameters(
 	dialParams.ReplayIgnoredChange = isReplay && configChanged
 	dialParams.CandidateNumber = candidateNumber
 	dialParams.EstablishedTunnelsCount = establishedTunnelsCount
+	dialParams.FrontedMeekCDNCandidateNumber = frontedMeekCDNCandidateNumber
 
 	// Set the DSLPrioritizedDial flag for metrics. The flag is set after
 	// replacing the pending placholder and retained as long as the dial
@@ -1067,37 +1078,6 @@ func MakeDialParameters(
 		}
 	}
 
-	// Initialize dialParams.ResolveParameters for dials that will resolve
-	// domain names, which currently includes fronted meek and Conjure API
-	// registration, where the dial address is not an IP address.
-	//
-	// dialParams.ResolveParameters must be nil when the dial address is an IP
-	// address to ensure that no DNS dial parameters are reported in metrics
-	// or diagnostics when when no domain is resolved.
-	//
-	// No resolve parameters are initialized for in-proxy dials; broker and
-	// STUN domain resolves use distinct ResolveParameters; and the proxy,
-	// not the client, resolves any 2nd hop dial address domain.
-	//
-	// Limitation: DNSResolverPreresolvedIPAddressCIDRs could be applied by
-	// the in-proxy client, and relayed to the proxy, enabling a preresolved
-	// dial by the proxy, but this is currently not compatible with broker
-	// dial destination verification.
-
-	useResolver := (protocol.TunnelProtocolUsesFrontedMeek(dialParams.TunnelProtocol) ||
-		dialParams.ConjureAPIRegistration) &&
-		!protocol.TunnelProtocolUsesInproxy(dialParams.TunnelProtocol) &&
-		net.ParseIP(dialParams.MeekFrontingDialAddress) == nil
-
-	if (!isReplay || !replayResolveParameters) && useResolver {
-
-		dialParams.ResolveParameters, err = dialParams.resolver.MakeResolveParameters(
-			p, dialParams.FrontingProviderID, dialParams.MeekFrontingDialAddress)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-	}
-
 	if !isReplay || !replayHoldOffTunnel {
 
 		var HoldOffTunnelProtocolDuration time.Duration
@@ -1485,6 +1465,7 @@ func MakeDialParameters(
 		dialParams.DirectDialAddress = net.JoinHostPort(serverEntry.IpAddress, dialParams.DialPortNumber)
 
 	case protocol.TUNNEL_PROTOCOL_FRONTED_MEEK,
+		protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_CDN,
 		protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH:
 
 		dialParams.MeekDialAddress = net.JoinHostPort(dialParams.MeekFrontingDialAddress, dialParams.DialPortNumber)
@@ -1522,6 +1503,19 @@ func MakeDialParameters(
 			"unknown tunnel protocol: %s", dialParams.TunnelProtocol)
 	}
 
+	if (!isReplay || !replayFronting) &&
+		protocol.TunnelProtocolUsesFrontedMeekCDN(dialParams.TunnelProtocol) {
+
+		var ok bool
+		ok, err = dialParams.applyFrontedMeekDialOverride(p)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		if !ok {
+			return nil, nil
+		}
+	}
+
 	if protocol.TunnelProtocolUsesMeek(dialParams.TunnelProtocol) {
 
 		host, _, _ := net.SplitHostPort(dialParams.MeekDialAddress)
@@ -1538,6 +1532,37 @@ func MakeDialParameters(
 		// we record the correct value for stats.
 		if net.ParseIP(dialParams.MeekSNIServerName) != nil {
 			dialParams.MeekSNIServerName = ""
+		}
+	}
+
+	// Initialize dialParams.ResolveParameters for dials that will resolve
+	// domain names, which currently includes fronted meek and Conjure API
+	// registration, where the dial address is not an IP address.
+	//
+	// dialParams.ResolveParameters must be nil when the dial address is an IP
+	// address to ensure that no DNS dial parameters are reported in metrics
+	// or diagnostics when when no domain is resolved.
+	//
+	// No resolve parameters are initialized for in-proxy dials; broker and
+	// STUN domain resolves use distinct ResolveParameters; and the proxy,
+	// not the client, resolves any 2nd hop dial address domain.
+	//
+	// Limitation: DNSResolverPreresolvedIPAddressCIDRs could be applied by
+	// the in-proxy client, and relayed to the proxy, enabling a preresolved
+	// dial by the proxy, but this is currently not compatible with broker
+	// dial destination verification.
+
+	useResolver := (protocol.TunnelProtocolUsesFrontedMeek(dialParams.TunnelProtocol) ||
+		dialParams.ConjureAPIRegistration) &&
+		!protocol.TunnelProtocolUsesInproxy(dialParams.TunnelProtocol) &&
+		net.ParseIP(dialParams.MeekFrontingDialAddress) == nil
+
+	if (!isReplay || !replayResolveParameters) && useResolver {
+
+		dialParams.ResolveParameters, err = dialParams.resolver.MakeResolveParameters(
+			p, dialParams.FrontingProviderID, dialParams.MeekFrontingDialAddress)
+		if err != nil {
+			return nil, errors.Trace(err)
 		}
 	}
 
@@ -1754,13 +1779,15 @@ func MakeDialParameters(
 	if protocol.TunnelProtocolUsesMeek(dialParams.TunnelProtocol) ||
 		dialParams.ConjureAPIRegistration {
 
+		clientTunnelProtocol := protocol.TunnelProtocolBase(dialParams.TunnelProtocol)
+
 		// For tactics requests, AddPsiphonFrontingHeader is set when set for
 		// the related tunnel protocol. E.g., FRONTED-OSSH-MEEK for
 		// FRONTED-MEEK-TACTICS. AddPsiphonFrontingHeader is not replayed.
 		addFrontingHeader := addPsiphonFrontingHeader(
 			p,
 			dialParams.FrontingProviderID,
-			dialParams.TunnelProtocol,
+			clientTunnelProtocol,
 			dialParams.MeekDialAddress,
 			dialParams.ResolveParameters)
 
@@ -1785,11 +1812,13 @@ func MakeDialParameters(
 			SNIServerName:                 dialParams.MeekSNIServerName,
 			AddPsiphonFrontingHeader:      addFrontingHeader,
 			VerifyServerName:              dialParams.MeekVerifyServerName,
+			VerifyServerNames:             dialParams.MeekVerifyServerNames,
 			VerifyPins:                    dialParams.MeekVerifyPins,
+			ALPNProtocols:                 dialParams.MeekTLSALPNProtocols,
 			DisableSystemRootCAs:          config.DisableSystemRootCAs,
 			HostHeader:                    dialParams.MeekHostHeader,
 			TransformedHostName:           dialParams.MeekTransformedHostName,
-			ClientTunnelProtocol:          dialParams.TunnelProtocol,
+			ClientTunnelProtocol:          clientTunnelProtocol,
 			MeekCookieEncryptionPublicKey: serverEntry.MeekCookieEncryptionPublicKey,
 			MeekObfuscatedKey:             serverEntry.MeekObfuscatedKey,
 			MeekObfuscatorPaddingSeed:     dialParams.MeekObfuscatorPaddingSeed,
@@ -2179,6 +2208,94 @@ func selectFrontingParameters(
 	}
 
 	return frontingDialHost, frontingHost, nil
+}
+
+func (dialParams *DialParameters) applyFrontedMeekDialOverride(
+	p parameters.ParametersAccessor) (bool, error) {
+
+	override, ok, err := p.FrontedMeekDialOverrides(
+		parameters.FrontedMeekDialOverrides).SelectCandidateParameters(
+		dialParams.FrontingProviderID,
+		dialParams.MeekFrontingDialAddress,
+		dialParams.MeekFrontingHost,
+		dialParams.frontedMeekCDNDialOverrideCandidateNumber())
+	if err != nil {
+		return false, errors.Trace(err)
+	}
+	if !ok {
+		return false, nil
+	}
+
+	dialParams.MeekFrontingDialOverrideID = override.OverrideID
+	dialParams.MeekFrontingDialAddress = override.DialAddress
+	dialParams.MeekDialAddress = net.JoinHostPort(
+		override.DialAddress, dialParams.DialPortNumber)
+	dialParams.MeekSNIServerName = override.SNIServerName
+	dialParams.MeekTransformedHostName =
+		override.SNIServerName != "" &&
+			override.SNIServerName != override.DialAddress
+
+	dialParams.MeekVerifyServerNames = override.VerifyServerNames
+	dialParams.MeekVerifyServerName = ""
+	if len(override.VerifyServerNames) > 0 {
+		dialParams.MeekVerifyServerName = override.VerifyServerNames[0]
+	}
+	dialParams.MeekVerifyPins = override.VerifyPins
+	dialParams.MeekTLSALPNProtocols = override.ALPNProtocols
+
+	if override.TLSProfile != "" {
+		err = dialParams.applyFrontedMeekDialOverrideTLSProfile(
+			p, override.TLSProfile)
+		if err != nil {
+			return false, errors.Trace(err)
+		}
+	}
+
+	return true, nil
+}
+
+func (dialParams *DialParameters) frontedMeekCDNDialOverrideCandidateNumber() int {
+
+	if dialParams.FrontedMeekCDNCandidateNumber < 0 {
+		return 0
+	}
+
+	return dialParams.FrontedMeekCDNCandidateNumber
+}
+
+func (dialParams *DialParameters) applyFrontedMeekDialOverrideTLSProfile(
+	p parameters.ParametersAccessor, tlsProfile string) error {
+
+	dialParams.SelectedTLSProfile = true
+	dialParams.TLSProfile = tlsProfile
+	dialParams.TLSVersion = ""
+	dialParams.RandomizedTLSProfileSeed = nil
+
+	utlsClientHelloID, utlsClientHelloSpec, err := getUTLSClientHelloID(
+		p, tlsProfile)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	if protocol.TLSProfileIsRandomized(tlsProfile) {
+		dialParams.RandomizedTLSProfileSeed, err = prng.NewSeed()
+		if err != nil {
+			return errors.Trace(err)
+		}
+		utlsClientHelloID.Seed = new(utls.PRNGSeed)
+		*utlsClientHelloID.Seed = [32]byte(*dialParams.RandomizedTLSProfileSeed)
+		weights := utls.DefaultWeights
+		weights.TLSVersMax_Set_VersionTLS13 = 0.5
+		utlsClientHelloID.Weights = &weights
+	}
+
+	dialParams.TLSVersion, err = getClientHelloVersion(
+		utlsClientHelloID, utlsClientHelloSpec)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	return nil
 }
 
 func selectQUICVersion(

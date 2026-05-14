@@ -531,6 +531,10 @@ func noticeWithDialParameters(noticeType string, dialParams *DialParameters, pos
 			args = append(args, "meekDialAddress", dialParams.MeekDialAddress)
 		}
 
+		if dialParams.MeekFrontingDialOverrideID != "" {
+			args = append(args, "meekFrontingDialOverrideID", dialParams.MeekFrontingDialOverrideID)
+		}
+
 		if protocol.TunnelProtocolUsesFrontedMeek(dialParams.TunnelProtocol) {
 
 			meekResolvedIPAddress := dialParams.MeekResolvedIPAddress.Load().(string)
@@ -542,6 +546,10 @@ func noticeWithDialParameters(noticeType string, dialParams *DialParameters, pos
 
 		if dialParams.MeekSNIServerName != "" {
 			args = append(args, "meekSNIServerName", dialParams.MeekSNIServerName)
+		}
+
+		if len(dialParams.MeekTLSALPNProtocols) > 0 {
+			args = append(args, "meekTLSALPNProtocols", strings.Join(dialParams.MeekTLSALPNProtocols, ","))
 		}
 
 		if dialParams.MeekHostHeader != "" {

@@ -137,6 +137,25 @@ func TestTLSCertificateVerification(t *testing.T) {
 		conn.Close()
 	}
 
+	// Test: with SNI changed and VerifyServerNames containing a valid fallback,
+	// the TLS dial succeeds.
+
+	conn, err = CustomTLSDial(
+		context.Background(), "tcp", serverAddr,
+		&CustomTLSConfig{
+			Parameters:                    params,
+			Dial:                          dialer,
+			SNIServerName:                 "not-" + serverName,
+			VerifyServerNames:             []string{"not-" + serverName, serverName},
+			TrustedCACertificatesFilename: rootCAsFileName,
+		})
+
+	if err != nil {
+		t.Errorf("CustomTLSDial failed: %v", err)
+	} else {
+		conn.Close()
+	}
+
 	// Test: with an invalid pin, the TLS dial fails.
 
 	invalidPin := base64.StdEncoding.EncodeToString(make([]byte, 32))

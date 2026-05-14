@@ -112,6 +112,7 @@ type Controller struct {
 	serverEntryIterationMetricsMutex                    sync.Mutex
 	serverEntryIterationUniqueCandidates                *hyperloglog.Sketch
 	serverEntryIterationFirstFrontedMeekCandidateNumber int
+	serverEntryIterationFrontedMeekCDNCandidateCount    int
 	serverEntryIterationMovedToFrontCount               int
 
 	currentNetworkMutex      sync.Mutex
@@ -1702,13 +1703,19 @@ func (p *protocolSelectionConstraints) hasInitialProtocols() bool {
 	return len(p.initialLimitTunnelProtocols) > 0 && p.initialLimitTunnelProtocolsCandidateCount > 0
 }
 
+func (p *protocolSelectionConstraints) conditionallyEnabledComponents() conditionallyEnabledComponents {
+	return conditionallyEnabledComponents{
+		frontedMeekCDNEnabled: p.config.FrontedMeekCDNEnabled(),
+	}
+}
+
 func (p *protocolSelectionConstraints) isInitialCandidate(
 	excludeIntensive bool,
 	serverEntry *protocol.ServerEntry) bool {
 
 	return p.hasInitialProtocols() &&
 		len(serverEntry.GetSupportedProtocols(
-			conditionallyEnabledComponents{},
+			p.conditionallyEnabledComponents(),
 			p.config.UseUpstreamProxy(),
 			p.initialLimitTunnelProtocols,
 			p.limitTunnelDialPortNumbers,
@@ -1721,7 +1728,7 @@ func (p *protocolSelectionConstraints) isCandidate(
 	serverEntry *protocol.ServerEntry) bool {
 
 	return len(serverEntry.GetSupportedProtocols(
-		conditionallyEnabledComponents{},
+		p.conditionallyEnabledComponents(),
 		p.config.UseUpstreamProxy(),
 		p.limitTunnelProtocols,
 		p.limitTunnelDialPortNumbers,
@@ -1765,7 +1772,7 @@ func (p *protocolSelectionConstraints) supportedProtocols(
 	serverEntry *protocol.ServerEntry) protocol.TunnelProtocols {
 
 	return serverEntry.GetSupportedProtocols(
-		conditionallyEnabledComponents{},
+		p.conditionallyEnabledComponents(),
 		p.config.UseUpstreamProxy(),
 		p.getLimitTunnelProtocols(connectTunnelCount),
 		p.limitTunnelDialPortNumbers,
@@ -2453,6 +2460,7 @@ func (controller *Controller) resetServerEntryIterationMetrics() {
 
 	controller.serverEntryIterationUniqueCandidates = hyperloglog.New()
 	controller.serverEntryIterationFirstFrontedMeekCandidateNumber = -1
+	controller.serverEntryIterationFrontedMeekCDNCandidateCount = 0
 	controller.serverEntryIterationMovedToFrontCount = 0
 }
 
@@ -3043,7 +3051,8 @@ loop:
 			controller.inproxyNATStateManager,
 			false,
 			controller.establishConnectTunnelCount,
-			int(atomic.LoadInt32(&controller.establishedTunnelsCount)))
+			int(atomic.LoadInt32(&controller.establishedTunnelsCount)),
+			controller.serverEntryIterationFrontedMeekCDNCandidateCount)
 		if dialParams == nil || err != nil {
 
 			controller.concurrentEstablishTunnelsMutex.Unlock()
@@ -3076,6 +3085,10 @@ loop:
 		// server entries are deleted.
 		establishConnectTunnelCount := controller.establishConnectTunnelCount
 		controller.establishConnectTunnelCount += 1
+
+		if protocol.TunnelProtocolUsesFrontedMeekCDN(dialParams.TunnelProtocol) {
+			controller.serverEntryIterationFrontedMeekCDNCandidateCount += 1
+		}
 
 		isIntensive := protocol.TunnelProtocolIsResourceIntensive(dialParams.TunnelProtocol)
 

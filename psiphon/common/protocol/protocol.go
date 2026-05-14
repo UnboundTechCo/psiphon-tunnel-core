@@ -41,6 +41,7 @@ const (
 	TUNNEL_PROTOCOL_UNFRONTED_MEEK_HTTPS             = "UNFRONTED-MEEK-HTTPS-OSSH"
 	TUNNEL_PROTOCOL_UNFRONTED_MEEK_SESSION_TICKET    = "UNFRONTED-MEEK-SESSION-TICKET-OSSH"
 	TUNNEL_PROTOCOL_FRONTED_MEEK                     = "FRONTED-MEEK-OSSH"
+	TUNNEL_PROTOCOL_FRONTED_MEEK_CDN                 = "FRONTED-MEEK-CDN-OSSH"
 	TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP                = "FRONTED-MEEK-HTTP-OSSH"
 	TUNNEL_PROTOCOL_QUIC_OBFUSCATED_SSH              = "QUIC-OSSH"
 	TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH = "FRONTED-MEEK-QUIC-OSSH"
@@ -222,6 +223,7 @@ var SupportedTunnelProtocols = TunnelProtocols{
 	TUNNEL_PROTOCOL_UNFRONTED_MEEK_HTTPS,
 	TUNNEL_PROTOCOL_UNFRONTED_MEEK_SESSION_TICKET,
 	TUNNEL_PROTOCOL_FRONTED_MEEK,
+	TUNNEL_PROTOCOL_FRONTED_MEEK_CDN,
 	TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP,
 	TUNNEL_PROTOCOL_QUIC_OBFUSCATED_SSH,
 	TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH,
@@ -293,7 +295,8 @@ func TunnelProtocolIsCompatibleWithInproxy(protocol string) bool {
 	// The TapDance and Conjure destination addresses are not included
 	// in the server entry, so TAPDANCE-OSSH and CONJURE-OSSH dial
 	// destinations cannot be validated for inproxy use.
-	return !TunnelProtocolUsesRefractionNetworking(protocol)
+	return !TunnelProtocolUsesRefractionNetworking(protocol) &&
+		!TunnelProtocolUsesFrontedMeekCDN(protocol)
 }
 
 func TunnelProtocolUsesTCP(protocol string) bool {
@@ -334,8 +337,14 @@ func TunnelProtocolUsesMeek(protocol string) bool {
 func TunnelProtocolUsesFrontedMeek(protocol string) bool {
 	protocol = TunnelProtocolMinusInproxy(protocol)
 	return protocol == TUNNEL_PROTOCOL_FRONTED_MEEK ||
+		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_CDN ||
 		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP ||
 		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH
+}
+
+func TunnelProtocolUsesFrontedMeekCDN(protocol string) bool {
+	protocol = TunnelProtocolMinusInproxy(protocol)
+	return protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_CDN
 }
 
 func TunnelProtocolUsesMeekHTTP(protocol string) bool {
@@ -352,6 +361,7 @@ func TunnelProtocolUsesMeekHTTPNormalizer(protocol string) bool {
 func TunnelProtocolUsesMeekHTTPS(protocol string) bool {
 	protocol = TunnelProtocolMinusInproxy(protocol)
 	return protocol == TUNNEL_PROTOCOL_FRONTED_MEEK ||
+		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_CDN ||
 		protocol == TUNNEL_PROTOCOL_UNFRONTED_MEEK_HTTPS ||
 		protocol == TUNNEL_PROTOCOL_UNFRONTED_MEEK_SESSION_TICKET
 }
@@ -412,6 +422,7 @@ func TunnelProtocolIsCompatibleWithFragmentor(protocol string) bool {
 		protocol == TUNNEL_PROTOCOL_UNFRONTED_MEEK_HTTPS ||
 		protocol == TUNNEL_PROTOCOL_UNFRONTED_MEEK_SESSION_TICKET ||
 		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK ||
+		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_CDN ||
 		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP ||
 		protocol == TUNNEL_PROTOCOL_CONJURE_OBFUSCATED_SSH ||
 		protocol == TUNNEL_PROTOCOL_SHADOWSOCKS_OSSH
@@ -452,7 +463,20 @@ func TunnelProtocolSupportsUpstreamProxy(protocol string) bool {
 }
 
 func TunnelProtocolSupportsTactics(protocol string) bool {
-	return TunnelProtocolUsesMeek(protocol)
+	return TunnelProtocolUsesMeek(protocol) &&
+		!TunnelProtocolUsesFrontedMeekCDN(protocol)
+}
+
+func TunnelProtocolBase(protocol string) string {
+	inproxy := TunnelProtocolUsesInproxy(protocol)
+	baseProtocol := TunnelProtocolMinusInproxy(protocol)
+	if baseProtocol == TUNNEL_PROTOCOL_FRONTED_MEEK_CDN {
+		baseProtocol = TUNNEL_PROTOCOL_FRONTED_MEEK
+	}
+	if inproxy {
+		return TunnelProtocolPlusInproxyWebRTC(baseProtocol)
+	}
+	return baseProtocol
 }
 
 func TunnelProtocolMayUseServerPacketManipulation(protocol string) bool {

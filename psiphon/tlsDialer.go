@@ -115,6 +115,11 @@ type CustomTLSConfig struct {
 	// hostname.
 	VerifyServerName string
 
+	// VerifyServerNames specifies one or more domain names, any one of which
+	// may appear in the server certificate. When specified, certificate
+	// verification checks these names in place of the dial or SNI hostname.
+	VerifyServerNames []string
+
 	// VerifyPins specifies one or more certificate pin values, one of which must
 	// appear in the verified server certificate chain. A pin value is the
 	// base64-encoded SHA2 digest of a certificate's public key. When specified,
@@ -183,6 +188,10 @@ type CustomTLSConfig struct {
 
 	// ClientSessionCache specifies the cache to use to persist session tickets.
 	ClientSessionCache utls.ClientSessionCache
+
+	// ALPNProtocols optionally overrides the TLS ALPN protocols offered by the
+	// selected TLS profile.
+	ALPNProtocols []string
 }
 
 // NewCustomTLSDialer creates a new dialer based on CustomTLSDial.
@@ -218,15 +227,17 @@ func CustomTLSDial(
 	// config.DisableSystemRootCAs is only used on iOS < 15 and
 	// config.VerifyLegacyCertificate is only used for Windows VPN mode.
 	skipVerify := config.SkipVerify || config.DisableSystemRootCAs
+	customVerifyServerNames := makeVerifyServerNames(
+		config.VerifyServerName, config.VerifyServerNames)
 
 	if (skipVerify &&
 		(config.VerifyLegacyCertificate != nil ||
-			len(config.VerifyServerName) > 0 ||
+			len(customVerifyServerNames) > 0 ||
 			len(config.VerifyPins) > 0)) ||
 
 		(config.VerifyLegacyCertificate != nil &&
 			(skipVerify ||
-				len(config.VerifyServerName) > 0 ||
+				len(customVerifyServerNames) > 0 ||
 				len(config.VerifyPins) > 0)) {
 
 		return nil, errors.TraceNew("incompatible certification verification parameters")
@@ -281,7 +292,10 @@ func CustomTLSDial(
 
 	tlsConfigInsecureSkipVerify := false
 	tlsConfigServerName := ""
-	verifyServerName := hostname
+	verifyServerNames := []string{hostname}
+	if len(customVerifyServerNames) > 0 {
+		verifyServerNames = customVerifyServerNames
+	}
 
 	if skipVerify {
 		tlsConfigInsecureSkipVerify = true
@@ -311,8 +325,9 @@ func CustomTLSDial(
 
 	// When VerifyServerName does not match the SNI, custom certificate
 	// verification is necessary.
-	if config.VerifyServerName != "" && config.VerifyServerName != tlsConfigServerName {
-		verifyServerName = config.VerifyServerName
+	if len(customVerifyServerNames) > 0 &&
+		(len(customVerifyServerNames) != 1 ||
+			customVerifyServerNames[0] != tlsConfigServerName) {
 		tlsConfigInsecureSkipVerify = true
 	}
 
@@ -338,8 +353,8 @@ func CustomTLSDial(
 					return errors.TraceNew("unexpected verified chains")
 				}
 				var err error
-				verifiedChains, err = common.VerifyServerCertificate(
-					tlsConfigRootCAs, rawCerts, verifyServerName)
+				verifiedChains, err = verifyServerCertificateAny(
+					tlsConfigRootCAs, rawCerts, verifyServerNames)
 				if err != nil {
 					return errors.Trace(err)
 				}
@@ -597,6 +612,14 @@ func CustomTLSDial(
 		needRemarshal = true
 	}
 
+	if len(config.ALPNProtocols) > 0 {
+		setUConnALPNProtocols(conn, tlsConfig, config.ALPNProtocols)
+		if !containsString(config.ALPNProtocols, "h2") {
+			conn.Extensions = removeApplicationSettingsExtension(conn.Extensions)
+		}
+		needRemarshal = true
+	}
+
 	if config.TLSPadding > 0 {
 
 		tlsPadding := config.TLSPadding
@@ -722,6 +745,95 @@ func verifyLegacyCertificate(rawCerts [][]byte, expectedCertificate *x509.Certif
 		return errors.TraceNew("unexpected certificate")
 	}
 	return nil
+}
+
+func makeVerifyServerNames(verifyServerName string, verifyServerNames []string) []string {
+	names := make([]string, 0, 1+len(verifyServerNames))
+	if verifyServerName != "" {
+		names = append(names, verifyServerName)
+	}
+	for _, name := range verifyServerNames {
+		if name != "" && !containsString(names, name) {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func verifyServerCertificateAny(
+	rootCAs *x509.CertPool, rawCerts [][]byte, verifyServerNames []string) ([][]*x509.Certificate, error) {
+
+	var lastErr error
+	for _, verifyServerName := range verifyServerNames {
+		verifiedChains, err := common.VerifyServerCertificate(
+			rootCAs, rawCerts, verifyServerName)
+		if err == nil {
+			return verifiedChains, nil
+		}
+		lastErr = err
+	}
+
+	if lastErr != nil {
+		return nil, errors.Trace(lastErr)
+	}
+	return nil, errors.TraceNew("missing verify server name")
+}
+
+func setUConnALPNProtocols(
+	conn *utls.UConn, tlsConfig *utls.Config, ALPNProtocols []string) {
+
+	protocols := copyStringSlice(ALPNProtocols)
+	tlsConfig.NextProtos = protocols
+	conn.HandshakeState.Hello.AlpnProtocols = protocols
+
+	updated := false
+	for index, extension := range conn.Extensions {
+		if _, ok := extension.(*utls.ALPNExtension); ok {
+			conn.Extensions[index] = &utls.ALPNExtension{
+				AlpnProtocols: protocols,
+			}
+			updated = true
+			break
+		}
+	}
+
+	if !updated {
+		conn.Extensions = append(
+			conn.Extensions,
+			&utls.ALPNExtension{
+				AlpnProtocols: protocols,
+			})
+	}
+}
+
+func removeApplicationSettingsExtension(
+	extensions []utls.TLSExtension) []utls.TLSExtension {
+
+	filteredExtensions := extensions[:0]
+	for _, extension := range extensions {
+		if _, ok := extension.(*utls.ApplicationSettingsExtension); !ok {
+			filteredExtensions = append(filteredExtensions, extension)
+		}
+	}
+	return filteredExtensions
+}
+
+func copyStringSlice(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	copiedValues := make([]string, len(values))
+	copy(copiedValues, values)
+	return copiedValues
+}
+
+func containsString(values []string, value string) bool {
+	for _, candidate := range values {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
 }
 
 func IsTLSConnUsingHTTP2(conn net.Conn) bool {

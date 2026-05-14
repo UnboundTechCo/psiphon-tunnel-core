@@ -953,6 +953,11 @@ type Config struct {
 	CustomHostNameProbability    *float64 `json:",omitempty"`
 	CustomHostNameLimitProtocols []string `json:",omitempty"`
 
+	// FrontedMeekDialOverrides configures optional fronted meek outer-dial
+	// replacement rules.
+	FrontedMeekDialOverrides            parameters.FrontedMeekDialOverrideSpecs `json:",omitempty"`
+	FrontedMeekDialOverridesProbability *float64                                `json:",omitempty"`
+
 	// ConjureCachedRegistrationTTLSeconds and other Conjure fields are for
 	// testing purposes.
 	ConjureCachedRegistrationTTLSeconds       *int                       `json:",omitempty"`
@@ -1799,6 +1804,18 @@ func (config *Config) GetParameters() *parameters.Parameters {
 	return config.params
 }
 
+func (config *Config) FrontedMeekCDNEnabled() bool {
+	if config == nil {
+		return false
+	}
+	params := config.GetParameters()
+	if params == nil {
+		return false
+	}
+	return len(params.Get().FrontedMeekDialOverrides(
+		parameters.FrontedMeekDialOverrides)) > 0
+}
+
 // SetParameters resets the parameters.Parameters to the default values,
 // applies any config file values, and then applies the input parameters (from
 // tactics, etc.)
@@ -2374,6 +2391,14 @@ func (config *Config) makeConfigParameters() map[string]interface{} {
 
 	if config.CustomHostNameLimitProtocols != nil {
 		applyParameters[parameters.CustomHostNameLimitProtocols] = protocol.TunnelProtocols(config.CustomHostNameLimitProtocols)
+	}
+
+	if len(config.FrontedMeekDialOverrides) > 0 {
+		applyParameters[parameters.FrontedMeekDialOverrides] = config.FrontedMeekDialOverrides
+	}
+
+	if config.FrontedMeekDialOverridesProbability != nil {
+		applyParameters[parameters.FrontedMeekDialOverridesProbability] = *config.FrontedMeekDialOverridesProbability
 	}
 
 	if config.ConjureCachedRegistrationTTLSeconds != nil {
@@ -3296,6 +3321,19 @@ func (config *Config) setDialParametersHash() {
 		for _, protocol := range config.CustomHostNameLimitProtocols {
 			hash.Write([]byte(protocol))
 		}
+	}
+
+	if len(config.FrontedMeekDialOverrides) > 0 {
+		hash.Write([]byte("FrontedMeekDialOverrides"))
+		for _, override := range config.FrontedMeekDialOverrides {
+			encodedOverride, _ := json.Marshal(override)
+			hash.Write(encodedOverride)
+		}
+	}
+
+	if config.FrontedMeekDialOverridesProbability != nil {
+		hash.Write([]byte("FrontedMeekDialOverridesProbability"))
+		binary.Write(hash, binary.LittleEndian, *config.FrontedMeekDialOverridesProbability)
 	}
 
 	if config.ConjureCachedRegistrationTTLSeconds != nil {

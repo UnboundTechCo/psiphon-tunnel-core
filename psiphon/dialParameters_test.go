@@ -134,6 +134,19 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 	applyParameters[parameters.ShadowsocksPrefixProbability] = 1.0
 	applyParameters[parameters.ShadowsocksPrefixSpecs] = transforms.Specs{"spec": transforms.Spec{{"", ""}}}
 	applyParameters[parameters.ShadowsocksPrefixScopedSpecNames] = transforms.ScopedSpecNames{"": {"spec"}}
+	if protocol.TunnelProtocolUsesFrontedMeekCDN(tunnelProtocol) {
+		applyParameters[parameters.FrontedMeekDialOverrides] = parameters.FrontedMeekDialOverrideSpecs{
+			&parameters.FrontedMeekDialOverride{
+				OverrideID:              "test-cdn",
+				MatchDialAddressRegexes: []string{".*"},
+				DialAddresses:           []string{"cdn.example.org"},
+				SNIServerName:           "cdn.example.org",
+				VerifyServerNames:       []string{"cdn.example.org"},
+				ALPNProtocols:           []string{"http/1.1"},
+			},
+		}
+		applyParameters[parameters.FrontedMeekDialOverridesProbability] = 1.0
+	}
 
 	err = clientConfig.SetParameters("tag1", false, applyParameters)
 	if err != nil {
@@ -1218,6 +1231,9 @@ func TestLimitTunnelDialPortNumbers(t *testing.T) {
 		if common.Contains(protocol.DefaultDisabledTunnelProtocols, tunnelProtocol) {
 			continue
 		}
+		if protocol.TunnelProtocolUsesFrontedMeekCDN(tunnelProtocol) {
+			continue
+		}
 
 		serverEntries := makeMockServerEntries(tunnelProtocol, "", "", "", 100)
 
@@ -1465,4 +1481,32 @@ func TestMakeOSSHObfuscatorSeedTranformerParameters(t *testing.T) {
 		})
 	}
 
+}
+
+func TestFrontedMeekCDNDialOverrideCandidateNumber(t *testing.T) {
+
+	testCases := []struct {
+		name                 string
+		cdnCandidateNumber   int
+		expectedCandidateNum int
+	}{
+		{"first CDN candidate", 0, 0},
+		{"second CDN candidate", 1, 1},
+		{"later CDN candidate", 7, 7},
+		{"negative CDN candidate", -1, 0},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			dialParams := &DialParameters{
+				FrontedMeekCDNCandidateNumber: testCase.cdnCandidateNumber,
+			}
+
+			candidateNumber := dialParams.frontedMeekCDNDialOverrideCandidateNumber()
+			if candidateNumber != testCase.expectedCandidateNum {
+				t.Fatalf("got %d, expected %d",
+					candidateNumber, testCase.expectedCandidateNum)
+			}
+		})
+	}
 }

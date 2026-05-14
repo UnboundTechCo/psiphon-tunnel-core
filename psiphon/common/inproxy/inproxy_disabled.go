@@ -120,6 +120,10 @@ func (conn *webRTCConn) GetMetrics() common.LogFields {
 	return nil
 }
 
+func (conn *webRTCConn) GetRemoteProxyIP() net.IP {
+	return nil
+}
+
 func GetQUICMaxPacketSizeAdjustment() int {
 	return 0
 }

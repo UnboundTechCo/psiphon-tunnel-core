@@ -190,6 +190,11 @@ type MeekConfig struct {
 	// certificate. When blank, server certificate verification is disabled.
 	VerifyServerName string
 
+	// VerifyServerNames specifies one or more domain names, any one of which
+	// may appear in the server certificate. When blank, server certificate
+	// verification is disabled unless VerifyServerName is set.
+	VerifyServerNames []string
+
 	// VerifyPins specifies one or more certificate pin values, one of which must
 	// appear in the verified server certificate chain. A pin value is the
 	// base64-encoded SHA2 digest of a certificate's public key. When specified,
@@ -207,6 +212,10 @@ type MeekConfig struct {
 	// When DisableSystemRootCAs is set, both VerifyServerName and VerifyPins
 	// must not be set.
 	DisableSystemRootCAs bool
+
+	// ALPNProtocols optionally overrides the TLS ALPN protocols offered by the
+	// selected TLS profile.
+	ALPNProtocols []string
 
 	// ClientTunnelProtocol is the protocol the client is using. It's included in
 	// the meek cookie for optional use by the server, in cases where the server
@@ -323,8 +332,11 @@ func DialMeek(
 			"invalid config: TLSClientSessionCache must be set when UseHTTPS is set")
 	}
 
+	verifyServerNames := makeVerifyServerNames(
+		meekConfig.VerifyServerName, meekConfig.VerifyServerNames)
+
 	if meekConfig.UseQUIC &&
-		(meekConfig.VerifyServerName != "" || len(meekConfig.VerifyPins) > 0) {
+		(len(verifyServerNames) > 0 || len(meekConfig.VerifyPins) > 0) {
 
 		// TODO: UseQUIC VerifyServerName and VerifyPins support (required for MeekModePlaintextRoundTrip).
 
@@ -332,14 +344,14 @@ func DialMeek(
 			"invalid config: VerifyServerName and VerifyPins not supported for UseQUIC")
 	}
 
-	skipVerify := meekConfig.VerifyServerName == ""
+	skipVerify := len(verifyServerNames) == 0
 	if len(meekConfig.VerifyPins) > 0 && skipVerify {
 		return nil, errors.TraceNew(
 			"invalid config: VerifyServerName must be set when VerifyPins is set")
 	}
 
 	if meekConfig.DisableSystemRootCAs &&
-		(len(meekConfig.VerifyServerName) > 0 || len(meekConfig.VerifyPins) > 0) {
+		(len(verifyServerNames) > 0 || len(meekConfig.VerifyPins) > 0) {
 		return nil, errors.TraceNew(
 			"invalid config: VerifyServerName and VerifyPins must not be set when DisableSystemRootCAs is set")
 	}
@@ -491,8 +503,10 @@ func DialMeek(
 			SNIServerName:                 meekConfig.SNIServerName,
 			SkipVerify:                    skipVerify,
 			VerifyServerName:              meekConfig.VerifyServerName,
+			VerifyServerNames:             meekConfig.VerifyServerNames,
 			VerifyPins:                    meekConfig.VerifyPins,
 			DisableSystemRootCAs:          meekConfig.DisableSystemRootCAs,
+			ALPNProtocols:                 meekConfig.ALPNProtocols,
 			TLSProfile:                    meekConfig.TLSProfile,
 			NoDefaultTLSSessionID:         &meekConfig.NoDefaultTLSSessionID,
 			RandomizedTLSProfileSeed:      meekConfig.RandomizedTLSProfileSeed,

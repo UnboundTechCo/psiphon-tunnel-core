@@ -776,7 +776,9 @@ func newTargetServerEntryIterator(config *Config, isTactics bool) (bool, *Server
 			// At the ServerEntryIterator level, only limitTunnelProtocols is applied;
 			// excludeIntensive and excludeInproxt are handled higher up.
 			if len(serverEntry.GetSupportedProtocols(
-				conditionallyEnabledComponents{},
+				conditionallyEnabledComponents{
+					frontedMeekCDNEnabled: config.FrontedMeekCDNEnabled(),
+				},
 				config.UseUpstreamProxy(),
 				limitTunnelProtocols,
 				limitTunnelDialPortNumbers,

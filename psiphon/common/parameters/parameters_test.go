@@ -176,6 +176,11 @@ func TestGetDefaultParameters(t *testing.T) {
 			if !reflect.DeepEqual(v, g) {
 				t.Fatalf("FrontingSpecs returned %+v expected %+v", g, v)
 			}
+		case FrontedMeekDialOverrideSpecs:
+			g := p.Get().FrontedMeekDialOverrides(name)
+			if !reflect.DeepEqual(v, g) {
+				t.Fatalf("FrontedMeekDialOverrideSpecs returned %+v expected %+v", g, v)
+			}
 		case TunnelProtocolPortLists:
 			g := p.Get().TunnelProtocolPortLists(name)
 			if !reflect.DeepEqual(v, g) {
