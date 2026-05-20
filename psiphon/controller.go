@@ -381,22 +381,31 @@ func (controller *Controller) Run(ctx context.Context) {
 
 	if !controller.config.DisableTunnels {
 
-		if !controller.config.DisableLocalSocksProxy {
-			socksProxy, err := NewSocksProxy(controller.config, controller, listenIP)
+		if controller.config.LocalSocksProxyPort == controller.config.LocalHttpProxyPort && !controller.config.DisableLocalSocksProxy && !controller.config.DisableLocalHTTPProxy {
+			mixedProxy, err := NewMixedProxy(controller.config, controller, listenIP)
 			if err != nil {
-				NoticeError("error initializing local SOCKS proxy: %v", errors.Trace(err))
+				NoticeError("error initializing local mixed proxy: %v", errors.Trace(err))
 				return
 			}
-			defer socksProxy.Close()
-		}
+			defer mixedProxy.Close()
+		} else {
+			if !controller.config.DisableLocalSocksProxy {
+				socksProxy, err := NewSocksProxy(controller.config, controller, listenIP)
+				if err != nil {
+					NoticeError("error initializing local SOCKS proxy: %v", errors.Trace(err))
+					return
+				}
+				defer socksProxy.Close()
+			}
 
-		if !controller.config.DisableLocalHTTPProxy {
-			httpProxy, err := NewHttpProxy(controller.config, controller, listenIP)
-			if err != nil {
-				NoticeError("error initializing local HTTP proxy: %v", errors.Trace(err))
-				return
+			if !controller.config.DisableLocalHTTPProxy {
+				httpProxy, err := NewHttpProxy(controller.config, controller, listenIP)
+				if err != nil {
+					NoticeError("error initializing local HTTP proxy: %v", errors.Trace(err))
+					return
+				}
+				defer httpProxy.Close()
 			}
-			defer httpProxy.Close()
 		}
 
 		if controller.config.EnableUpgradeDownload {
