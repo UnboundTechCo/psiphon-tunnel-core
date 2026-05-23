@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -47,6 +48,7 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/resolver"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/transforms"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/tun"
 	"golang.org/x/crypto/nacl/secretbox"
 )
 
@@ -72,7 +74,6 @@ const (
 // corresponding fields are int pointers. nil means no value was supplied and
 // to use the default; a non-nil pointer to 0 means no timeout.
 type Config struct {
-
 	// DataRootDirectory is the directory in which to store persistent files,
 	// which contain information such as server entries. By default, current
 	// working directory.
@@ -228,6 +229,7 @@ type Config struct {
 	// EstablishTunnelTimeoutSeconds specifies a time limit after which to
 	// halt the core tunnel controller if no tunnel has been established. The
 	// default is parameters.EstablishTunnelTimeout.
+	// This timeout takes effect regardless of light proxy configuration.
 	EstablishTunnelTimeoutSeconds *int `json:",omitempty"`
 
 	// EstablishTunnelPausePeriodSeconds specifies the delay between attempts
@@ -675,14 +677,37 @@ type Config struct {
 	InproxyProxySessionPrivateKey string `json:",omitempty"`
 
 	// InproxyProxySplitUpstreamInterfaceName specifies a network interface
-	// that the in-proxy proxy will use for upstream destination dialing. The
-	// specified interface is also excluded from proxy ICE gathering. This is
-	// intended to support split interface setups with the proxy/client
-	// connection on the default interface and the proxy/server connection on
-	// the designated interface.
+	// that the in-proxy proxy will use for upstream destination dialing,
+	// including the broker connection, the proxy/server connection, and any
+	// other in-proxy proxy upstream traffic. The specified interface is
+	// also excluded from proxy ICE gathering. This is intended to support
+	// split interface setups with the proxy/client connection on one
+	// interface and the proxy/server connection on the other.
 	//
-	// Only supported on Linux, and cannot be used with DeviceBinder.
+	// Setting either InproxyProxySplitUpstreamInterfaceName or
+	// InproxyProxySplitDownstreamInterfaceName activates split-interface
+	// mode. When only one is set, tunnel-core fills in the counterpart by
+	// selecting the first non-loopback, up interface that has at least one
+	// address and is not the set interface. This auto-detection is
+	// best-effort and may not select the intended interface in systems with
+	// more than two eligible interfaces; setting both fields explicitly is
+	// recommended.
+	//
+	// Supported on Linux and Windows, and cannot be used with DeviceBinder.
+	// On Windows, interface names must match the FriendlyName that Go
+	// exposes as net.Interface.Name. The Windows binding uses IP_UNICAST_IF
+	// / IPV6_UNICAST_IF, which is semantically "route via interface X"
+	// rather than the stronger Linux SO_BINDTODEVICE.
 	InproxyProxySplitUpstreamInterfaceName string `json:",omitempty"`
+
+	// InproxyProxySplitDownstreamInterfaceName specifies the network
+	// interface that the in-proxy proxy will use for downstream
+	// proxy/client-facing dials, including ICE, STUN, and the WebRTC data
+	// channel. It is the complement of InproxyProxySplitUpstreamInterfaceName
+	// in a split-interface setup. See InproxyProxySplitUpstreamInterfaceName
+	// for the activation, auto-detection, and platform support rules that
+	// apply to both fields.
+	InproxyProxySplitDownstreamInterfaceName string `json:",omitempty"`
 
 	// InproxyMaxClients specifies the maximum number of common in-proxy
 	// clients to be proxied concurrently. When InproxyEnableProxy is set,
@@ -848,6 +873,17 @@ type Config struct {
 	// diagnostics. When the egress region list is not required, disabling
 	// this expensive scan can improve datastore performance on slower devices.
 	DisableServerEntriesReporter *bool `json:",omitempty"`
+
+	// EnableLightProxy enables using a light proxy as fallback if a tunnel is
+	// not available to tunnel traffic. When a light proxy is used, neither
+	// EgressRegion nor any SplitTunnel configuration is applied.
+	EnableLightProxy bool `json:",omitempty"`
+
+	// LightProxyEntry is an optional encoded light proxy entry.
+	LightProxyEntry []byte `json:",omitempty"`
+
+	// LightProxyEntryTracker is the light proxy entry tracker value to report.
+	LightProxyEntryTracker int64 `json:",omitempty"`
 
 	//
 	// The following parameters are deprecated.
@@ -1297,6 +1333,19 @@ type Config struct {
 
 	TunnelConnectTimeoutSeconds *int `json:",omitempty"`
 
+	LightProxyUseRecommendedSNIProbability        *float64 `json:",omitempty"`
+	LightProxyCustomHostNameRegexes               []string `json:",omitempty"`
+	LightProxyCustomHostNameProbability           *float64 `json:",omitempty"`
+	LightProxyTunnelInactiveThresholdMilliseconds *int     `json:",omitempty"`
+	LightProxyDialTimeoutMilliseconds             *int     `json:",omitempty"`
+
+	TacticsWaitPeriodMilliseconds  *int     `json:",omitempty"`
+	TacticsRetryPeriodMilliseconds *int     `json:",omitempty"`
+	TacticsRetryPeriodJitter       *float64 `json:",omitempty"`
+	TacticsTimeoutMilliseconds     *int     `json:",omitempty"`
+
+	LightProxyTestFetchAddress string `json:",omitempty"`
+
 	// params is the active parameters.Parameters with defaults, config values,
 	// and, optionally, tactics applied.
 	//
@@ -1311,13 +1360,15 @@ type Config struct {
 	sponsorID          string
 	authorizations     []string
 
-	deviceBinder    DeviceBinder
-	networkIDGetter *cachingNetworkIDGetter
+	hostDeviceBinder DeviceBinder
+	splitInterface   *splitInterfaceState
+	networkIDGetter  *cachingNetworkIDGetter
 
 	clientFeatures []string
 
 	resolverMutex sync.Mutex
 	resolver      *resolver.Resolver
+	splitResolver *resolver.Resolver
 
 	committed bool
 
@@ -1362,7 +1413,6 @@ type UseNoticeFiles struct {
 // Before using the Config, Commit must be called, which will perform further
 // validation and initialize internal data structures.
 func LoadConfig(configJson []byte) (*Config, error) {
-
 	var config Config
 	err := json.Unmarshal(configJson, &config)
 	if err != nil {
@@ -1420,7 +1470,6 @@ func (config *Config) IsCommitted() bool {
 // because file system errors are expected to be rare and persistent files will
 // be re-populated over time.
 func (config *Config) Commit(migrateFromLegacyFields bool) error {
-
 	// Apply any additional parameters first
 	additionalParametersInfoMsgs, err := config.applyAdditionalParameters()
 	if err != nil {
@@ -1673,11 +1722,17 @@ func (config *Config) Commit(migrateFromLegacyFields bool) error {
 		return errors.TraceNew("invalid ObfuscatedSSHAlgorithms")
 	}
 
-	if config.InproxyProxySplitUpstreamInterfaceName != "" && runtime.GOOS != "linux" {
-		return errors.TraceNew("InproxyProxySplitUpstreamInterfaceName is only supported on Linux")
+	splitInterfaceMode := config.InproxyProxySplitUpstreamInterfaceName != "" ||
+		config.InproxyProxySplitDownstreamInterfaceName != ""
+	if splitInterfaceMode && runtime.GOOS != "linux" && runtime.GOOS != "windows" {
+		return errors.TraceNew("InproxyProxySplit{Upstream,Downstream}InterfaceName is only supported on Linux and Windows")
 	}
-	if config.InproxyProxySplitUpstreamInterfaceName != "" && config.DeviceBinder != nil {
-		return errors.TraceNew("InproxyProxySplitUpstreamInterfaceName cannot be used with DeviceBinder")
+	if splitInterfaceMode && config.DeviceBinder != nil {
+		return errors.TraceNew("InproxyProxySplit{Upstream,Downstream}InterfaceName cannot be used with DeviceBinder")
+	}
+	if config.InproxyProxySplitUpstreamInterfaceName != "" &&
+		config.InproxyProxySplitDownstreamInterfaceName == config.InproxyProxySplitUpstreamInterfaceName {
+		return errors.TraceNew("InproxyProxySplitDownstreamInterfaceName must differ from InproxyProxySplitUpstreamInterfaceName")
 	}
 
 	if config.InproxyEnableProxy {
@@ -1749,6 +1804,17 @@ func (config *Config) Commit(migrateFromLegacyFields bool) error {
 		return errors.TraceNew("build does not enable required in-proxy functionality")
 	}
 
+	if config.EnableLightProxy {
+
+		if config.DisableTunnels {
+			return errors.TraceNew("EnableLightProxy is incompatible with DisableTunnels")
+		}
+
+		if config.DisableLocalSocksProxy && config.DisableLocalHTTPProxy {
+			return errors.TraceNew("EnableLightProxy is incompatible with disabled local proxies")
+		}
+	}
+
 	// This constraint is expected by logic in Controller.runTunnels().
 
 	if config.PacketTunnelTunFileDescriptor > 0 && config.TunnelPoolSize != 1 {
@@ -1799,7 +1865,7 @@ func (config *Config) Commit(migrateFromLegacyFields bool) error {
 
 	config.SetDynamicConfig(config.SponsorId, config.Authorizations)
 
-	// Initialize config.deviceBinder and config.config.networkIDGetter. These
+	// Initialize config.hostDeviceBinder and config.networkIDGetter. These
 	// wrap config.DeviceBinder and config.NetworkIDGetter/NetworkID with
 	// loggers.
 	//
@@ -1807,11 +1873,60 @@ func (config *Config) Commit(migrateFromLegacyFields bool) error {
 	// cachingNetworkIDGetter doc).
 	//
 	// New variables are set to avoid mutating input config fields.
-	// Internally, code must use config.deviceBinder and
-	// config.networkIDGetter and not the input/exported fields.
+	// Internally, code must use Config.deviceBinder /
+	// Config.splitDeviceBinder and config.networkIDGetter and not the
+	// input/exported fields.
 
 	if config.DeviceBinder != nil {
-		config.deviceBinder = newLoggingDeviceBinder(config.DeviceBinder)
+		config.hostDeviceBinder = newLoggingDeviceBinder(config.DeviceBinder)
+	}
+
+	if splitInterfaceMode {
+
+		// Resolve and wire up the split-interface state. Bind sites read
+		// the upstream and downstream binders via Config.deviceBinder and
+		// Config.splitDeviceBinder. The upstream binder is applied
+		// to all upstream-destined dials, including the broker
+		// connection, the in-proxy proxy/server connection, and related
+		// tunnel-core dials. The downstream binder is applied to ICE,
+		// STUN, and WebRTC mux sockets, which must traverse the
+		// non-upstream interface.
+		//
+		// Either interface name may be left unset, in which case the
+		// counterpart is filled in by best-effort auto-detection against
+		// the explicitly set interface. Both names must be resolved here,
+		// before any sockets are created. If either ends up unresolved,
+		// Commit fails: silently leaving a binder unset would cause the
+		// affected call sites to either fall back to the wrong binder or
+		// leave sockets unbound, both of which defeat the split-interface
+		// configuration.
+
+		upstreamInterfaceName := config.InproxyProxySplitUpstreamInterfaceName
+		downstreamInterfaceName := config.InproxyProxySplitDownstreamInterfaceName
+		if upstreamInterfaceName == "" {
+			upstreamInterfaceName = findInterfaceExcluding(downstreamInterfaceName)
+		}
+		if downstreamInterfaceName == "" {
+			downstreamInterfaceName = findInterfaceExcluding(upstreamInterfaceName)
+		}
+		if upstreamInterfaceName == "" {
+			return errors.TraceNew(
+				"unable to determine upstream interface for split-interface in-proxy proxy; " +
+					"set InproxyProxySplitUpstreamInterfaceName")
+		}
+		if downstreamInterfaceName == "" {
+			return errors.TraceNew(
+				"unable to determine downstream interface for split-interface in-proxy proxy; " +
+					"set InproxyProxySplitDownstreamInterfaceName")
+		}
+
+		config.splitInterface = &splitInterfaceState{
+			upstreamDeviceBinder: newLoggingDeviceBinder(
+				&interfaceDeviceBinder{interfaceName: upstreamInterfaceName}),
+			downstreamDeviceBinder: newLoggingDeviceBinder(
+				&interfaceDeviceBinder{interfaceName: downstreamInterfaceName}),
+			upstreamInterfaceName: upstreamInterfaceName,
+		}
 	}
 
 	networkIDGetter := config.NetworkIDGetter
@@ -1951,7 +2066,6 @@ func (config *Config) FrontedMeekCDNEnabled() bool {
 // entirely unmodified.
 func (config *Config) SetParameters(
 	tag string, skipOnError bool, applyParameters map[string]interface{}) error {
-
 	setParameters := []map[string]interface{}{config.makeConfigParameters()}
 	if applyParameters != nil {
 		setParameters = append(setParameters, applyParameters)
@@ -2035,6 +2149,28 @@ func (config *Config) SetResolver(resolver *resolver.Resolver) {
 func (config *Config) GetResolver() *resolver.Resolver {
 	config.resolverMutex.Lock()
 	defer config.resolverMutex.Unlock()
+	return config.resolver
+}
+
+// SetSplitResolver sets the current split-interface resolver, used in
+// split-interface mode for downstream/ICE-facing DNS resolves.
+func (config *Config) SetSplitResolver(resolver *resolver.Resolver) {
+	config.resolverMutex.Lock()
+	defer config.resolverMutex.Unlock()
+	config.splitResolver = resolver
+}
+
+// GetSplitResolver returns the resolver bound to the split (downstream /
+// ICE-facing) interface in split-interface mode. Outside split mode (or
+// when no split resolver has been set) it falls back to GetResolver, so
+// callers can use GetSplitResolver unconditionally for any
+// split-side-relevant resolve.
+func (config *Config) GetSplitResolver() *resolver.Resolver {
+	config.resolverMutex.Lock()
+	defer config.resolverMutex.Unlock()
+	if config.splitResolver != nil {
+		return config.splitResolver
+	}
 	return config.resolver
 }
 
@@ -2179,7 +2315,6 @@ func (config *Config) IsInproxyProxyPersonalPairingMode() bool {
 // functionality -- onInproxyMustUpgrade initiates a shutdown after emitting
 // the InproxyMustUpgrade notice.
 func (config *Config) OnInproxyMustUpgrade() {
-
 	// TODO: check if LimitTunnelProtocols is set to allow only INPROXY tunnel
 	// protocols; this is another case where in-proxy functionality is
 	// required.
@@ -2194,7 +2329,6 @@ func (config *Config) OnInproxyMustUpgrade() {
 
 func (config *Config) SetServerEntryIterationMetricsUpdater(
 	updater func(movedToFront int)) {
-
 	config.serverEntryIterationMetricsUpdater.Store(updater)
 }
 
@@ -2207,7 +2341,6 @@ func (config *Config) GetServerEntryIterationMetricsUpdater() func(movedToFront 
 }
 
 func (config *Config) makeConfigParameters() map[string]interface{} {
-
 	// Build set of config values to apply to parameters.
 	//
 	// Note: names of some config fields such as
@@ -3297,6 +3430,22 @@ func (config *Config) makeConfigParameters() map[string]interface{} {
 		applyParameters[parameters.TunnelConnectTimeout] = fmt.Sprintf("%ds", *config.TunnelConnectTimeoutSeconds)
 	}
 
+	if config.TacticsWaitPeriodMilliseconds != nil {
+		applyParameters[parameters.TacticsWaitPeriod] = fmt.Sprintf("%dms", *config.TacticsWaitPeriodMilliseconds)
+	}
+
+	if config.TacticsRetryPeriodMilliseconds != nil {
+		applyParameters[parameters.TacticsRetryPeriod] = fmt.Sprintf("%dms", *config.TacticsRetryPeriodMilliseconds)
+	}
+
+	if config.TacticsRetryPeriodJitter != nil {
+		applyParameters[parameters.TacticsRetryPeriodJitter] = *config.TacticsRetryPeriodJitter
+	}
+
+	if config.TacticsTimeoutMilliseconds != nil {
+		applyParameters[parameters.TacticsTimeout] = fmt.Sprintf("%dms", *config.TacticsTimeoutMilliseconds)
+	}
+
 	if config.SSHChannelWindowSize != nil {
 		applyParameters[parameters.SSHChannelWindowSize] = *config.SSHChannelWindowSize
 	}
@@ -3307,6 +3456,28 @@ func (config *Config) makeConfigParameters() map[string]interface{} {
 
 	if config.DisableServerEntriesReporter != nil {
 		applyParameters[parameters.DisableServerEntriesReporter] = *config.DisableServerEntriesReporter
+	}
+
+	if config.LightProxyCustomHostNameRegexes != nil {
+		applyParameters[parameters.LightProxyCustomHostNameRegexes] =
+			parameters.RegexStrings(config.LightProxyCustomHostNameRegexes)
+	}
+
+	if config.LightProxyCustomHostNameProbability != nil {
+		applyParameters[parameters.LightProxyCustomHostNameProbability] =
+			*config.LightProxyCustomHostNameProbability
+	}
+
+	if config.LightProxyUseRecommendedSNIProbability != nil {
+		applyParameters[parameters.LightProxyUseRecommendedSNIProbability] = *config.LightProxyUseRecommendedSNIProbability
+	}
+
+	if config.LightProxyTunnelInactiveThresholdMilliseconds != nil {
+		applyParameters[parameters.LightProxyTunnelInactiveThreshold] = fmt.Sprintf("%dms", *config.LightProxyTunnelInactiveThresholdMilliseconds)
+	}
+
+	if config.LightProxyDialTimeoutMilliseconds != nil {
+		applyParameters[parameters.LightProxyDialTimeout] = fmt.Sprintf("%dms", *config.LightProxyDialTimeoutMilliseconds)
 	}
 
 	// When adding new config dial parameters that may override tactics, also
@@ -3589,6 +3760,18 @@ func (config *Config) setDialParametersHash() {
 	if config.FrontedMeekDialOverridesProbability != nil {
 		hash.Write([]byte("FrontedMeekDialOverridesProbability"))
 		binary.Write(hash, binary.LittleEndian, *config.FrontedMeekDialOverridesProbability)
+	}
+
+	if len(config.LightProxyCustomHostNameRegexes) > 0 {
+		hash.Write([]byte("LightProxyCustomHostNameRegexes"))
+		for _, regex := range config.LightProxyCustomHostNameRegexes {
+			hash.Write([]byte(regex))
+		}
+	}
+
+	if config.LightProxyCustomHostNameProbability != nil {
+		hash.Write([]byte("LightProxyCustomHostNameProbability"))
+		binary.Write(hash, binary.LittleEndian, *config.LightProxyCustomHostNameProbability)
 	}
 
 	if config.ConjureCachedRegistrationTTLSeconds != nil {
@@ -4293,6 +4476,98 @@ func (d *loggingDeviceBinder) BindToDevice(fileDescriptor int) (string, error) {
 		NoticeBindToDevice(deviceInfo)
 	}
 	return deviceInfo, err
+}
+
+// splitInterfaceState holds the resolved split-interface in-proxy proxy
+// configuration. It is nil unless split-interface mode is active. See
+// InproxyProxySplitUpstreamInterfaceName and
+// InproxyProxySplitDownstreamInterfaceName.
+//
+// The upstream and downstream binders are logging-wrapped, ready to use at
+// bind sites. upstreamInterfaceName is the resolved name, exposed for call
+// sites that need it as a string (e.g., ICE gathering exclusion).
+type splitInterfaceState struct {
+	upstreamDeviceBinder   DeviceBinder
+	downstreamDeviceBinder DeviceBinder
+	upstreamInterfaceName  string
+}
+
+// deviceBinder returns the default DeviceBinder for dials. In
+// split-interface mode it is the binder for the upstream interface;
+// otherwise it is the host-app-provided DeviceBinder (which may be nil).
+// The returned binder, when non-nil, is logging-wrapped.
+func (config *Config) deviceBinder() DeviceBinder {
+	if config.splitInterface != nil {
+		return config.splitInterface.upstreamDeviceBinder
+	}
+	return config.hostDeviceBinder
+}
+
+// splitDeviceBinder returns the DeviceBinder for the split (downstream /
+// ICE-facing) side of a split-interface configuration. Outside split mode
+// it falls back to deviceBinder, so callers can use splitDeviceBinder
+// unconditionally to mean "the split-specific binder if relevant, the
+// regular one otherwise". The returned binder, when non-nil, is
+// logging-wrapped.
+func (config *Config) splitDeviceBinder() DeviceBinder {
+	if config.splitInterface != nil {
+		return config.splitInterface.downstreamDeviceBinder
+	}
+	return config.deviceBinder()
+}
+
+// splitInterfaceUpstreamInterfaceName returns the resolved upstream
+// interface name in split-interface mode, or "" otherwise. It is used by
+// call sites that need the upstream interface name as a string, such as
+// ICE gathering exclusion.
+func (config *Config) splitInterfaceUpstreamInterfaceName() string {
+	if config.splitInterface != nil {
+		return config.splitInterface.upstreamInterfaceName
+	}
+	return ""
+}
+
+// interfaceDeviceBinder implements DeviceBinder by binding sockets to a
+// named network interface via tun.BindToDevice. It is used to wire up the
+// upstream and downstream interfaces in a split-interface in-proxy proxy
+// configuration; see InproxyProxySplitUpstreamInterfaceName and
+// InproxyProxySplitDownstreamInterfaceName.
+type interfaceDeviceBinder struct {
+	interfaceName string
+}
+
+func (b *interfaceDeviceBinder) BindToDevice(fileDescriptor int) (string, error) {
+	err := tun.BindToDevice(fileDescriptor, b.interfaceName)
+	if err != nil {
+		return "", errors.Trace(err)
+	}
+	return b.interfaceName, nil
+}
+
+// findInterfaceExcluding returns the name of the first non-loopback, up
+// interface that has at least one address and whose name does not match
+// excludeName. It is the best-effort fallback used to fill in the
+// counterpart interface in a split-interface in-proxy proxy configuration
+// when only one of the upstream/downstream interface names is set.
+func findInterfaceExcluding(excludeName string) string {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range interfaces {
+		if iface.Name == excludeName {
+			continue
+		}
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil || len(addrs) == 0 {
+			continue
+		}
+		return iface.Name
+	}
+	return ""
 }
 
 const unknownNetworkID = "UNKNOWN"

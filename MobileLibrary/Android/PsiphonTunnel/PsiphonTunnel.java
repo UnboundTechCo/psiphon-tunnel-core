@@ -171,6 +171,10 @@ public class PsiphonTunnel {
          * @param region The server region received.
          */
         default void onConnectedServerRegion(String region) {}
+        /**
+         * Called when a light proxy is available to use even when no tunnel is connected.
+         */
+        default void onLightProxyAvailable() {}
         default void onExiting() {}
     }
 
@@ -625,7 +629,7 @@ public class PsiphonTunnel {
         // one has yet replaced it.
 
         String servers = mActiveNetworkDNSServers.get();
-        if (servers != "") {
+        if (!TextUtils.isEmpty(servers)) {
             return servers;
         }
 
@@ -978,6 +982,8 @@ public class PsiphonTunnel {
                         data.getLong("bytesDown"),
                         personalRegionActivity,
                         commonRegionActivity);
+            } else if (noticeType.equals("LightProxyAvailable")) {
+                mHostService.onLightProxyAvailable();
             }
 
             if (diagnostic) {
@@ -1064,12 +1070,7 @@ public class PsiphonTunnel {
 
         ArrayList<String> servers = new ArrayList<>();
         for (InetAddress serverAddress : getActiveNetworkDNSServerAddresses(context, isVpnMode)) {
-            String server = serverAddress.toString();
-            // strip the leading slash e.g., "/192.168.1.1"
-            if (server.startsWith("/")) {
-                server = server.substring(1);
-            }
-            servers.add(server);
+            addUsableDNSServer(servers, serverAddress, null);
         }
 
         if (servers.isEmpty()) {
@@ -1077,6 +1078,36 @@ public class PsiphonTunnel {
         }
 
         return servers;
+    }
+
+    private static void addUsableDNSServer(
+            Collection<String> servers, InetAddress serverAddress, String interfaceName) {
+
+        if (serverAddress == null ||
+                serverAddress.isAnyLocalAddress() ||
+                serverAddress.isMulticastAddress()) {
+            return;
+        }
+
+        String server = serverAddress.getHostAddress();
+
+        // IPv4 link-local is not usable. Append required zone/scope for
+        // link-local IPv6.
+        if (serverAddress.isLinkLocalAddress()) {
+            if (!(serverAddress instanceof Inet6Address)) {
+                return;
+            }
+            if (!server.contains("%")) {
+                if (TextUtils.isEmpty(interfaceName)) {
+                    return;
+                }
+                server = server + "%" + interfaceName;
+            }
+        }
+
+        if (!servers.contains(server)) {
+            servers.add(server);
+        }
     }
 
     private static Collection<InetAddress> getActiveNetworkDNSServerAddresses(Context context, boolean isVpnMode)
@@ -1396,11 +1427,10 @@ public class PsiphonTunnel {
                             if (linkProperties != null) {
                                 List<InetAddress> serverAddresses = linkProperties.getDnsServers();
                                 for (InetAddress serverAddress : serverAddresses) {
-                                    String server = serverAddress.toString();
-                                    if (server.startsWith("/")) {
-                                        server = server.substring(1);
-                                    }
-                                    servers.add(server);
+                                    addUsableDNSServer(
+                                            servers,
+                                            serverAddress,
+                                            linkProperties.getInterfaceName());
                                 }
                             }
                         } catch (java.lang.Exception ignored) {
