@@ -62,7 +62,12 @@ func NewSocksProxy(
 		return nil, errors.Trace(err)
 	}
 	socksListener := socks.NewSocksListener(listener)
-	socksListener.SetPreferUsernamePasswordAuth(localProxyAuthRequired(config))
+	socksListener.SetUsernamePasswordAuthRequired(func(remoteAddr net.Addr) bool {
+		if remoteAddr == nil {
+			return localProxyAuthRequired(config)
+		}
+		return localProxyAuthRequiredForClient(config, remoteAddr.String())
+	})
 	socksListener.SetUsernamePasswordValidator(func(username, password string) bool {
 		if !localProxyAuthRequired(config) {
 			return true
@@ -130,6 +135,22 @@ func (proxy *SocksProxy) socksConnectionHandler(localConn *socks.SocksConn) (err
 
 func localProxyAuthRequired(config *Config) bool {
 	return config != nil && config.LocalProxyUsername != "" && config.LocalProxyPassword != ""
+}
+
+func localProxyAuthRequiredForClient(config *Config, remoteAddr string) bool {
+	if !localProxyAuthRequired(config) {
+		return false
+	}
+	return !isLoopbackRemoteAddr(remoteAddr)
+}
+
+func isLoopbackRemoteAddr(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (proxy *SocksProxy) serve() {

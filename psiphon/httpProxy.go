@@ -252,7 +252,7 @@ func (proxy *HttpProxy) ServeHTTP(responseWriter http.ResponseWriter, request *h
 }
 
 func (proxy *HttpProxy) authorizeHTTPRequest(responseWriter http.ResponseWriter, request *http.Request) bool {
-	if !localProxyAuthRequired(proxy.config) {
+	if !localProxyAuthRequiredForClient(proxy.config, request.RemoteAddr) {
 		return true
 	}
 	username, password, ok := parseProxyBasicAuth(request.Header.Get("Proxy-Authorization"))

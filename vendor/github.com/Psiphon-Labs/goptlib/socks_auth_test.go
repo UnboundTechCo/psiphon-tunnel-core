@@ -3,6 +3,7 @@ package pt
 import (
 	"bufio"
 	"bytes"
+	"net"
 	"testing"
 )
 
@@ -42,6 +43,49 @@ func TestSocks5NegotiateAuthRejectsNoAuthWhenUsernamePasswordRequired(t *testing
 	}
 	if !bytes.Equal(output.Bytes(), []byte{socks5Version, socksAuthNoAcceptableMethods}) {
 		t.Fatalf("response = %#v, want no acceptable methods selection", output.Bytes())
+	}
+}
+
+func TestSocksListenerRequiresUsernamePasswordByRemoteAddr(t *testing.T) {
+	ln, err := ListenSocks("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("ListenSocks() error = %v", err)
+	}
+	defer ln.Close()
+
+	ln.SetUsernamePasswordAuthRequired(func(remoteAddr net.Addr) bool {
+		return remoteAddr != nil
+	})
+
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := ln.AcceptSocks()
+		if conn != nil {
+			conn.Close()
+		}
+		errCh <- err
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer conn.Close()
+
+	if _, err = conn.Write([]byte{socks5Version, 1, socksAuthNoneRequired}); err != nil {
+		t.Fatalf("conn.Write() error = %v", err)
+	}
+
+	response := make([]byte, 2)
+	if _, err = conn.Read(response); err != nil {
+		t.Fatalf("conn.Read() error = %v", err)
+	}
+	if !bytes.Equal(response, []byte{socks5Version, socksAuthNoAcceptableMethods}) {
+		t.Fatalf("response = %#v, want no acceptable methods selection", response)
+	}
+
+	if err = <-errCh; err == nil {
+		t.Fatal("AcceptSocks() error = nil, want auth negotiation failure")
 	}
 }
 

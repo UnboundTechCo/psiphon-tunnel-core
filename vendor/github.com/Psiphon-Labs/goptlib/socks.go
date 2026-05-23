@@ -140,8 +140,9 @@ func (conn *SocksConn) RejectReason(reason byte) error {
 //	}
 type SocksListener struct {
 	net.Listener
-	preferUsernamePasswordAuth bool
-	usernamePasswordValidator  func(username, password string) bool
+	preferUsernamePasswordAuth   bool
+	usernamePasswordAuthRequired func(remoteAddr net.Addr) bool
+	usernamePasswordValidator    func(username, password string) bool
 }
 
 // Open a net.Listener according to network and laddr, and return it as a
@@ -163,6 +164,15 @@ func NewSocksListener(ln net.Listener) *SocksListener {
 // username/password auth over no-auth when the client offers both.
 func (ln *SocksListener) SetPreferUsernamePasswordAuth(prefer bool) {
 	ln.preferUsernamePasswordAuth = prefer
+}
+
+// SetUsernamePasswordAuthRequired sets a callback used to decide whether
+// RFC1929 username/password auth is required for an accepted SOCKS5 client.
+// When this callback returns true, SOCKS5 negotiation rejects clients that
+// offer only no-auth.
+func (ln *SocksListener) SetUsernamePasswordAuthRequired(
+	authRequired func(remoteAddr net.Addr) bool) {
+	ln.usernamePasswordAuthRequired = authRequired
 }
 
 // SetUsernamePasswordValidator sets a callback used to validate RFC1929
@@ -223,6 +233,12 @@ func (ln *SocksListener) AcceptSocks() (*SocksConn, error) {
 		err = newTemporaryNetError("AcceptSocks: socksPeekByte() failed: %s", err.Error())
 		return nil, err
 	} else if version == socks4Version {
+		if ln.usernamePasswordAuthRequired != nil &&
+			ln.usernamePasswordAuthRequired(conn.RemoteAddr()) {
+			conn.Close()
+			err = newTemporaryNetError("AcceptSocks: SOCKS4 client rejected because username/password auth is required")
+			return nil, err
+		}
 		conn.socksVersion = socks4Version
 		conn.Req, err = readSocks4aConnect(rw.Reader)
 		if err != nil {
@@ -230,10 +246,15 @@ func (ln *SocksListener) AcceptSocks() (*SocksConn, error) {
 			return nil, err
 		}
 	} else if version == socks5Version {
+		preferUsernamePasswordAuth := ln.preferUsernamePasswordAuth
+		if ln.usernamePasswordAuthRequired != nil &&
+			ln.usernamePasswordAuthRequired(conn.RemoteAddr()) {
+			preferUsernamePasswordAuth = true
+		}
 		conn.socksVersion = socks5Version
 		conn.Req, err = socks5Handshake(
 			rw,
-			ln.preferUsernamePasswordAuth,
+			preferUsernamePasswordAuth,
 			ln.usernamePasswordValidator)
 		if err != nil {
 			conn.Close()
