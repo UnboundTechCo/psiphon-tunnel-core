@@ -125,6 +125,11 @@ type DialParameters struct {
 	MeekObfuscatorPaddingSeed  *prng.Seed   `json:",omitempty"`
 	MeekResolvedIPAddress      atomic.Value `json:"-"`
 
+	MeekEnablePayloadPadding          bool    `json:",omitempty"`
+	MeekPayloadPaddingMinSize         int     `json:",omitempty"`
+	MeekPayloadPaddingMaxSize         int     `json:",omitempty"`
+	MeekPayloadPaddingOmitProbability float64 `json:",omitempty"`
+
 	TLSOSSHTransformedSNIServerName bool       `json:",omitempty"`
 	TLSOSSHSNIServerName            string     `json:",omitempty"`
 	TLSOSSHObfuscatorPaddingSeed    *prng.Seed `json:",omitempty"`
@@ -183,6 +188,8 @@ type DialParameters struct {
 
 	DSLPendingPrioritizeDialTimestamp time.Time `json:",omitempty"`
 	DSLPrioritizedDial                bool      `json:",omitempty"`
+	DSLPrioritizedDialReason          string    `json:",omitempty"`
+	DSLPrioritizedTunnelProtocol      string    `json:",omitempty"`
 
 	quicTLSClientSessionCache *common.TLSClientSessionCacheWrapper  `json:"-"`
 	tlsClientSessionCache     *common.UtlsClientSessionCacheWrapper `json:"-"`
@@ -224,7 +231,9 @@ func MakeDialParameters(
 	tlsClientSessionCache utls.ClientSessionCache,
 	upstreamProxyErrorCallback func(error),
 	canReplay func(serverEntry *protocol.ServerEntry, replayProtocol string) bool,
-	selectProtocol func(serverEntry *protocol.ServerEntry) (string, bool),
+	selectProtocol func(
+		serverEntry *protocol.ServerEntry,
+		prioritizeTunnelProtocol string) (string, bool),
 	serverEntry *protocol.ServerEntry,
 	inproxyClientBrokerClientManager *InproxyBrokerClientManager,
 	inproxyClientNATStateManager *InproxyNATStateManager,
@@ -281,6 +290,7 @@ func MakeDialParameters(
 	replayShadowsocksPrefix := p.Bool(parameters.ReplayShadowsocksPrefix)
 	replayInproxySTUN := p.Bool(parameters.ReplayInproxySTUN)
 	replayInproxyWebRTC := p.Bool(parameters.ReplayInproxyWebRTC)
+	replayMeekPayloadPadding := p.Bool(parameters.ReplayMeekPayloadPadding)
 
 	// Check for existing dial parameters for this server/network ID.
 
@@ -316,6 +326,8 @@ func MakeDialParameters(
 	// server entry happens to have been used for a tunnel protocol. See
 	// fetchTactics.
 
+	dslPrioritizeDialReason := ""
+	dslPrioritizeTunnelProtocol := ""
 	dslPendingPrioritizeDial :=
 		dialParams != nil && !dialParams.DSLPendingPrioritizeDialTimestamp.IsZero()
 
@@ -337,6 +349,9 @@ func MakeDialParameters(
 				NoticeWarning("DeleteDialParameters failed: %s", err)
 			}
 		}
+
+		dslPrioritizeDialReason = dialParams.DSLPrioritizedDialReason
+		dslPrioritizeTunnelProtocol = dialParams.DSLPrioritizedTunnelProtocol
 
 		// Replace the placeholder with new dial parameters.
 		dialParams = nil
@@ -406,7 +421,7 @@ func MakeDialParameters(
 					p.Strings(parameters.ConjureSTUNServerAddresses),
 					dialParams.ConjureSTUNServerAddress)) ||
 			(dialParams.InproxySTUNDialParameters != nil &&
-				dialParams.InproxySTUNDialParameters.IsValidClientReplay(p)) ||
+				!dialParams.InproxySTUNDialParameters.IsValidClientReplay(p)) ||
 
 			// Legacy clients use ConjureAPIRegistrarURL with
 			// gotapdance.tapdance.APIRegistrar and new clients use
@@ -494,6 +509,13 @@ func MakeDialParameters(
 	// parameters are replayed.
 	dialParams.DSLPrioritizedDial =
 		dslPendingPrioritizeDial || (isReplay && dialParams.DSLPrioritizedDial)
+	if !dialParams.DSLPrioritizedDial {
+		dialParams.DSLPrioritizedDialReason = ""
+		dialParams.DSLPrioritizedTunnelProtocol = ""
+	} else if dslPendingPrioritizeDial {
+		dialParams.DSLPrioritizedDialReason = dslPrioritizeDialReason
+		dialParams.DSLPrioritizedTunnelProtocol = dslPrioritizeTunnelProtocol
+	}
 
 	// Even when replaying, LastUsedTimestamp is updated to extend the TTL of
 	// replayed dial parameters which will be updated in the datastore upon
@@ -554,12 +576,17 @@ func MakeDialParameters(
 
 	if !isReplay && !isExchanged {
 
+		// selectProtocol may ignore dslPrioritizeTunnelProtocol in preferInproxy
+		// and InitialLimit and LimitTunnelProtocol cases. Note that
+		// dsl_prioritized_tunnel_protocol is intentionally still reported as-is
+		// in server_tunnel.
+
 		// TODO: should there be a pre-check of selectProtocol before incurring
 		// overhead of unmarshaling dial parameters? In may be that a server entry
 		// is fully incapable of satisfying the current protocol selection
 		// constraints.
 
-		selectedProtocol, ok := selectProtocol(serverEntry)
+		selectedProtocol, ok := selectProtocol(serverEntry, dslPrioritizeTunnelProtocol)
 		if !ok {
 			return nil, nil
 		}
@@ -1078,6 +1105,27 @@ func MakeDialParameters(
 		}
 	}
 
+	if (!isReplay || !replayMeekPayloadPadding) &&
+		protocol.TunnelProtocolUsesMeek(dialParams.TunnelProtocol) {
+
+		limitTunnelProtocols := p.TunnelProtocols(
+			parameters.MeekPayloadPaddingLimitTunnelProtocols)
+
+		if len(limitTunnelProtocols) == 0 ||
+			common.Contains(limitTunnelProtocols, dialParams.TunnelProtocol) {
+
+			if p.WeightedCoinFlip(parameters.MeekPayloadPaddingProbability) {
+
+				dialParams.MeekEnablePayloadPadding = true
+				dialParams.MeekPayloadPaddingOmitProbability =
+					p.Float(parameters.MeekPayloadPaddingClientOmitProbability)
+				dialParams.MeekPayloadPaddingMinSize =
+					p.Int(parameters.MeekPayloadPaddingClientMinSize)
+				dialParams.MeekPayloadPaddingMaxSize =
+					p.Int(parameters.MeekPayloadPaddingClientMaxSize)
+			}
+		}
+	}
 	if !isReplay || !replayHoldOffTunnel {
 
 		var HoldOffTunnelProtocolDuration time.Duration
@@ -1822,6 +1870,10 @@ func MakeDialParameters(
 			MeekCookieEncryptionPublicKey: serverEntry.MeekCookieEncryptionPublicKey,
 			MeekObfuscatedKey:             serverEntry.MeekObfuscatedKey,
 			MeekObfuscatorPaddingSeed:     dialParams.MeekObfuscatorPaddingSeed,
+			EnablePayloadPadding:          dialParams.MeekEnablePayloadPadding,
+			PayloadPaddingMinSize:         dialParams.MeekPayloadPaddingMinSize,
+			PayloadPaddingMaxSize:         dialParams.MeekPayloadPaddingMaxSize,
+			PayloadPaddingOmitProbability: dialParams.MeekPayloadPaddingOmitProbability,
 			NetworkLatencyMultiplier:      dialParams.NetworkLatencyMultiplier,
 			HTTPTransformerParameters:     dialParams.HTTPTransformerParameters,
 			AdditionalHeaders:             config.MeekAdditionalHeaders,

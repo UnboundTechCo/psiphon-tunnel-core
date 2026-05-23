@@ -153,6 +153,9 @@ const (
 	SSHKeepAliveProbeInactivePeriod                    = "SSHKeepAliveProbeInactivePeriod"
 	SSHKeepAliveNetworkConnectivityPollingPeriod       = "SSHKeepAliveNetworkConnectivityPollingPeriod"
 	SSHKeepAliveResetOnFailureProbability              = "SSHKeepAliveResetOnFailureProbability"
+	SSHKeepAliveResumeProbeTimeout                     = "SSHKeepAliveResumeProbeTimeout"
+	SSHKeepAliveResumeProbeInactivePeriod              = "SSHKeepAliveResumeProbeInactivePeriod"
+	SSHKeepAliveResumeReconnectInactivePeriod          = "SSHKeepAliveResumeReconnectInactivePeriod"
 	HTTPProxyOriginServerTimeout                       = "HTTPProxyOriginServerTimeout"
 	HTTPProxyMaxIdleConnectionsPerHost                 = "HTTPProxyMaxIdleConnectionsPerHost"
 	FetchRemoteServerListTimeout                       = "FetchRemoteServerListTimeout"
@@ -251,6 +254,7 @@ const (
 	ReplayTLSFragmentClientHello                       = "ReplayTLSFragmentClientHello"
 	ReplayInproxyWebRTC                                = "ReplayInproxyWebRTC"
 	ReplayInproxySTUN                                  = "ReplayInproxySTUN"
+	ReplayMeekPayloadPadding                           = "ReplayMeekPayloadPadding"
 	APIRequestUpstreamPaddingMinBytes                  = "APIRequestUpstreamPaddingMinBytes"
 	APIRequestUpstreamPaddingMaxBytes                  = "APIRequestUpstreamPaddingMaxBytes"
 	APIRequestDownstreamPaddingMinBytes                = "APIRequestDownstreamPaddingMinBytes"
@@ -411,6 +415,7 @@ const (
 	InproxyAllBrokerSpecs                              = "InproxyAllBrokerSpecs"
 	InproxyBrokerSpecs                                 = "InproxyBrokerSpecs"
 	InproxyPersonalPairingBrokerSpecs                  = "InproxyPersonalPairingBrokerSpecs"
+	InproxyPersonalPairingMaxBrokerSpecCount           = "InproxyPersonalPairingMaxBrokerSpecCount"
 	InproxyProxyBrokerSpecs                            = "InproxyProxyBrokerSpecs"
 	InproxyProxyPersonalPairingBrokerSpecs             = "InproxyProxyPersonalPairingBrokerSpecs"
 	InproxyClientBrokerSpecs                           = "InproxyClientBrokerSpecs"
@@ -420,15 +425,18 @@ const (
 	InproxyReplayBrokerDialParametersProbability       = "InproxyReplayBrokerDialParametersProbability"
 	InproxyReplayBrokerRetainFailedProbability         = "InproxyReplayBrokerRetainFailedProbability"
 	InproxyAllCommonCompartmentIDs                     = "InproxyAllCommonCompartmentIDs"
+	InproxySponsorCommonCompartmentID                  = "InproxySponsorCommonCompartmentID"
 	InproxyCommonCompartmentIDs                        = "InproxyCommonCompartmentIDs"
 	InproxyMaxCompartmentIDListLength                  = "InproxyMaxCompartmentIDListLength"
 	InproxyBrokerMatcherAnnouncementLimitEntryCount    = "InproxyBrokerMatcherAnnouncementLimitEntryCount"
 	InproxyBrokerMatcherAnnouncementRateLimitQuantity  = "InproxyBrokerMatcherAnnouncementRateLimitQuantity"
 	InproxyBrokerMatcherAnnouncementRateLimitInterval  = "InproxyBrokerMatcherAnnouncementRateLimitInterval"
-	InproxyBrokerMatcherAnnouncementNonlimitedProxyIDs = "InproxyBrokerMatcherAnnouncementNonlimitedProxyIDs"
+	InproxyBrokerMatcherAnnouncementExemptProxyIDs     = "InproxyBrokerMatcherAnnouncementExemptProxyIDs"
+	InproxyBrokerMatcherAnnouncementExemptSponsorIDs   = "InproxyBrokerMatcherAnnouncementExemptSponsorIDs"
 	InproxyBrokerMatcherOfferLimitEntryCount           = "InproxyBrokerMatcherOfferLimitEntryCount"
 	InproxyBrokerMatcherOfferRateLimitQuantity         = "InproxyBrokerMatcherOfferRateLimitQuantity"
 	InproxyBrokerMatcherOfferRateLimitInterval         = "InproxyBrokerMatcherOfferRateLimitInterval"
+	InproxyBrokerMatcherOfferMinimumDeadline           = "InproxyBrokerMatcherOfferMinimumDeadline"
 	InproxyBrokerMatcherPrioritizeProxiesProbability   = "InproxyBrokerMatcherPrioritizeProxiesProbability"
 	InproxyBrokerMatcherPrioritizeProxiesFilter        = "InproxyBrokerMatcherPrioritizeProxiesFilter"
 	InproxyBrokerMatcherPrioritizeProxiesMinVersion    = "InproxyBrokerMatcherPrioritizeProxiesMinVersion"
@@ -532,8 +540,10 @@ const (
 	DSLRelayHttpIdleConnTimeout                        = "DSLRelayHttpIdleConnTimeout"
 	DSLRelayRequestTimeout                             = "DSLRelayRequestTimeout"
 	DSLRelayRetryCount                                 = "DSLRelayRetryCount"
-	DSLRelayCacheTTL                                   = "DSLRelayCacheTTL"
-	DSLRelayCacheMaxSize                               = "DSLRelayCacheMaxSize"
+	DSLRelayServerEntryCacheTTL                        = "DSLRelayServerEntryCacheTTL"
+	DSLRelayServerEntryCacheMaxSize                    = "DSLRelayServerEntryCacheMaxSize"
+	DSLRelayOSLFileSpecCacheTTL                        = "DSLRelayOSLFileSpecCacheTTL"
+	DSLRelayOSLFileSpecCacheMaxSize                    = "DSLRelayOSLFileSpecCacheMaxSize"
 	EnableDSLFetcher                                   = "EnableDSLFetcher"
 	DSLFetcherTunneledRequestTimeout                   = "DSLFetcherTunneledRequestTimeout"
 	DSLFetcherTunneledRequestRetryCount                = "DSLFetcherTunneledRequestRetryCount"
@@ -562,6 +572,19 @@ const (
 	DSLPrioritizeDialPlaceholderTTL                    = "DSLPrioritizeDialPlaceholderTTL"
 	ServerEntryIteratorMaxMoveToFront                  = "ServerEntryIteratorMaxMoveToFront"
 	ServerEntryIteratorResetProbability                = "ServerEntryIteratorResetProbability"
+	MeekPayloadPaddingProbability                      = "MeekPayloadPaddingProbability"
+	MeekPayloadPaddingLimitTunnelProtocols             = "MeekPayloadPaddingLimitTunnelProtocols"
+	MeekPayloadPaddingClientOmitProbability            = "MeekPayloadPaddingClientOmitProbability"
+	MeekPayloadPaddingClientMinSize                    = "MeekPayloadPaddingClientMinSize"
+	MeekPayloadPaddingClientMaxSize                    = "MeekPayloadPaddingClientMaxSize"
+	MeekPayloadPaddingServerOmitProbability            = "MeekPayloadPaddingServerOmitProbability"
+	MeekPayloadPaddingServerMinSize                    = "MeekPayloadPaddingServerMinSize"
+	MeekPayloadPaddingServerMaxSize                    = "MeekPayloadPaddingServerMaxSize"
+	ProxyProtocolHeaderTargetDestinationAddresses      = "ProxyProtocolHeaderTargetDestinationAddresses"
+	ProxyProtocolHeaderDefaultEnableProbability        = "ProxyProtocolHeaderDefaultEnableProbability"
+	SSHChannelWindowSize                               = "SSHChannelWindowSize"
+	SSHPacketTunnelChannelWindowSize                   = "SSHPacketTunnelChannelWindowSize"
+	DisableServerEntriesReporter                       = "DisableServerEntriesReporter"
 
 	// Retired parameters
 
@@ -707,6 +730,9 @@ var defaultParameters = map[string]struct {
 	SSHKeepAliveProbeInactivePeriod:              {value: 10 * time.Second, minimum: 1 * time.Second},
 	SSHKeepAliveNetworkConnectivityPollingPeriod: {value: 500 * time.Millisecond, minimum: 1 * time.Millisecond},
 	SSHKeepAliveResetOnFailureProbability:        {value: 0.0, minimum: 0.0},
+	SSHKeepAliveResumeProbeTimeout:               {value: 2500 * time.Millisecond, minimum: 1 * time.Millisecond, flags: useNetworkLatencyMultiplier},
+	SSHKeepAliveResumeProbeInactivePeriod:        {value: 1 * time.Second, minimum: 0 * time.Millisecond},
+	SSHKeepAliveResumeReconnectInactivePeriod:    {value: 2*time.Minute + 1*time.Second, minimum: 0 * time.Millisecond},
 
 	HTTPProxyOriginServerTimeout:       {value: 15 * time.Second, minimum: time.Duration(0), flags: useNetworkLatencyMultiplier},
 	HTTPProxyMaxIdleConnectionsPerHost: {value: 50, minimum: 0},
@@ -838,6 +864,7 @@ var defaultParameters = map[string]struct {
 	ReplayTLSFragmentClientHello:         {value: true},
 	ReplayInproxyWebRTC:                  {value: true},
 	ReplayInproxySTUN:                    {value: true},
+	ReplayMeekPayloadPadding:             {value: true},
 
 	APIRequestUpstreamPaddingMinBytes:   {value: 0, minimum: 0},
 	APIRequestUpstreamPaddingMaxBytes:   {value: 1024, minimum: 0},
@@ -1045,6 +1072,7 @@ var defaultParameters = map[string]struct {
 	InproxyAllBrokerSpecs:                              {value: InproxyBrokerSpecsValue{}, flags: serverSideOnly},
 	InproxyBrokerSpecs:                                 {value: InproxyBrokerSpecsValue{}},
 	InproxyPersonalPairingBrokerSpecs:                  {value: InproxyBrokerSpecsValue{}},
+	InproxyPersonalPairingMaxBrokerSpecCount:           {value: 3, minimum: 0},
 	InproxyProxyBrokerSpecs:                            {value: InproxyBrokerSpecsValue{}},
 	InproxyProxyPersonalPairingBrokerSpecs:             {value: InproxyBrokerSpecsValue{}},
 	InproxyClientBrokerSpecs:                           {value: InproxyBrokerSpecsValue{}},
@@ -1054,15 +1082,18 @@ var defaultParameters = map[string]struct {
 	InproxyReplayBrokerDialParametersProbability:       {value: 1.0, minimum: 0.0},
 	InproxyReplayBrokerRetainFailedProbability:         {value: 0.5, minimum: 0.0},
 	InproxyAllCommonCompartmentIDs:                     {value: []string{}, flags: serverSideOnly},
+	InproxySponsorCommonCompartmentID:                  {value: InproxyKeyCompartmentID{}, flags: serverSideOnly},
 	InproxyCommonCompartmentIDs:                        {value: InproxyCompartmentIDsValue{}},
 	InproxyMaxCompartmentIDListLength:                  {value: 50, minimum: 0},
 	InproxyBrokerMatcherAnnouncementLimitEntryCount:    {value: 50, minimum: 0, flags: serverSideOnly},
 	InproxyBrokerMatcherAnnouncementRateLimitQuantity:  {value: 50, minimum: 0, flags: serverSideOnly},
 	InproxyBrokerMatcherAnnouncementRateLimitInterval:  {value: 1 * time.Minute, minimum: time.Duration(0), flags: serverSideOnly},
-	InproxyBrokerMatcherAnnouncementNonlimitedProxyIDs: {value: []string{}, flags: serverSideOnly},
+	InproxyBrokerMatcherAnnouncementExemptProxyIDs:     {value: []string{}, flags: serverSideOnly},
+	InproxyBrokerMatcherAnnouncementExemptSponsorIDs:   {value: []string{}, flags: serverSideOnly},
 	InproxyBrokerMatcherOfferLimitEntryCount:           {value: 10, minimum: 0, flags: serverSideOnly},
 	InproxyBrokerMatcherOfferRateLimitQuantity:         {value: 50, minimum: 0, flags: serverSideOnly},
 	InproxyBrokerMatcherOfferRateLimitInterval:         {value: 1 * time.Minute, minimum: time.Duration(0), flags: serverSideOnly},
+	InproxyBrokerMatcherOfferMinimumDeadline:           {value: 1 * time.Second, minimum: time.Duration(0), flags: serverSideOnly},
 	InproxyBrokerMatcherPrioritizeProxiesProbability:   {value: 1.0, minimum: 0.0, flags: serverSideOnly},
 	InproxyBrokerMatcherPrioritizeProxiesFilter:        {value: KeyStrings{}, flags: serverSideOnly},
 	InproxyBrokerMatcherPrioritizeProxiesMinVersion:    {value: 0, minimum: 0, flags: serverSideOnly},
@@ -1172,8 +1203,10 @@ var defaultParameters = map[string]struct {
 	DSLRelayHttpIdleConnTimeout:                       {value: 120 * time.Second, minimum: time.Duration(0), flags: serverSideOnly},
 	DSLRelayRequestTimeout:                            {value: 30 * time.Second, minimum: time.Duration(0), flags: serverSideOnly},
 	DSLRelayRetryCount:                                {value: 1, minimum: 0, flags: serverSideOnly},
-	DSLRelayCacheTTL:                                  {value: 24 * time.Hour, minimum: time.Duration(0), flags: serverSideOnly},
-	DSLRelayCacheMaxSize:                              {value: 200000, minimum: 0, flags: serverSideOnly},
+	DSLRelayServerEntryCacheTTL:                       {value: 24 * time.Hour, minimum: time.Duration(0), flags: serverSideOnly},
+	DSLRelayServerEntryCacheMaxSize:                   {value: 250000, minimum: 0, flags: serverSideOnly},
+	DSLRelayOSLFileSpecCacheTTL:                       {value: 24 * time.Hour, minimum: time.Duration(0), flags: serverSideOnly},
+	DSLRelayOSLFileSpecCacheMaxSize:                   {value: 250000, minimum: 0, flags: serverSideOnly},
 	EnableDSLFetcher:                                  {value: false},
 	DSLFetcherTunneledRequestTimeout:                  {value: 5 * time.Second, minimum: time.Duration(0), flags: useNetworkLatencyMultiplier},
 	DSLFetcherTunneledRequestRetryCount:               {value: 0, minimum: 0},
@@ -1203,6 +1236,23 @@ var defaultParameters = map[string]struct {
 
 	ServerEntryIteratorMaxMoveToFront:   {value: -1, minimum: -1},
 	ServerEntryIteratorResetProbability: {value: 1.0, minimum: 0.0},
+
+	MeekPayloadPaddingProbability:           {value: 0.0, minimum: 0.0},
+	MeekPayloadPaddingLimitTunnelProtocols:  {value: protocol.TunnelProtocols{}},
+	MeekPayloadPaddingClientOmitProbability: {value: 0.0, minimum: 0.0},
+	MeekPayloadPaddingClientMinSize:         {value: 0, minimum: 0},
+	MeekPayloadPaddingClientMaxSize:         {value: 65533, minimum: 0},
+	MeekPayloadPaddingServerOmitProbability: {value: 0.0, minimum: 0.0, flags: serverSideOnly},
+	MeekPayloadPaddingServerMinSize:         {value: 0, minimum: 0, flags: serverSideOnly},
+	MeekPayloadPaddingServerMaxSize:         {value: 65533, minimum: 0, flags: serverSideOnly},
+
+	ProxyProtocolHeaderTargetDestinationAddresses: {value: KeyStrings{}, flags: serverSideOnly},
+	ProxyProtocolHeaderDefaultEnableProbability:   {value: 0.0, minimum: 0.0, flags: serverSideOnly},
+
+	SSHChannelWindowSize:             {value: 0, minimum: 0},
+	SSHPacketTunnelChannelWindowSize: {value: 0, minimum: 0},
+
+	DisableServerEntriesReporter: {value: false},
 }
 
 // IsServerSideOnly indicates if the parameter specified by name is used
@@ -1756,7 +1806,7 @@ func (p *Parameters) Set(
 			case InproxyBrokerSpecsValue:
 
 				var checkList *InproxyBrokerSpecsValue
-				if checkInproxyLists && name == InproxyBrokerSpecs {
+				if checkInproxyLists && name != InproxyAllBrokerSpecs {
 					checkList = &inproxyAllBrokerSpecs
 				}
 
@@ -1770,7 +1820,21 @@ func (p *Parameters) Set(
 			case InproxyCompartmentIDsValue:
 
 				var checkList *[]string
-				if checkInproxyLists && name == InproxyCommonCompartmentIDs {
+				if checkInproxyLists && name != InproxyAllCommonCompartmentIDs {
+					checkList = &inproxyAllCommonCompartmentIDs
+				}
+
+				err := v.Validate(checkList)
+				if err != nil {
+					if skipOnError {
+						continue
+					}
+					return nil, errors.Trace(err)
+				}
+			case InproxyKeyCompartmentID:
+
+				var checkList *[]string
+				if checkInproxyLists {
 					checkList = &inproxyAllCommonCompartmentIDs
 				}
 
@@ -2434,6 +2498,13 @@ func (p ParametersAccessor) InproxyCompartmentIDs(name string) InproxyCompartmen
 	return value
 }
 
+// InproxyKeyCompartmentID returns a InproxyKeyCompartmentID parameter value.
+func (p ParametersAccessor) InproxyKeyCompartmentID(name string) InproxyKeyCompartmentID {
+	value := InproxyKeyCompartmentID{}
+	p.snapshot.getValue(name, &value)
+	return value
+}
+
 // InproxyTrafficShapingParameters returns a InproxyTrafficShapingParameters
 // parameter value.
 func (p ParametersAccessor) InproxyTrafficShapingParameters(
@@ -2444,6 +2515,7 @@ func (p ParametersAccessor) InproxyTrafficShapingParameters(
 	return value
 }
 
+// LivenessTest returns a LivenessTestSpecs parameter value.
 func (p ParametersAccessor) LivenessTest(name string) LivenessTestSpecs {
 	value := make(LivenessTestSpecs)
 	p.snapshot.getValue(name, &value)

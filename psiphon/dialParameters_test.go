@@ -61,6 +61,7 @@ func (t *testNetworkGetter) GetNetworkID() string {
 func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 	t.Logf("Test %s...", tunnelProtocol)
+	ctx := context.Background()
 
 	testDataDirName, err := ioutil.TempDir("", "psiphon-dial-parameters-test")
 	if err != nil {
@@ -169,7 +170,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		return replayProtocol == tunnelProtocol
 	}
 
-	selectProtocol := func(serverEntry *protocol.ServerEntry) (string, bool) {
+	selectProtocol := func(serverEntry *protocol.ServerEntry, _ string) (string, bool) {
 		return tunnelProtocol, true
 	}
 
@@ -815,9 +816,16 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 	networkID := clientConfig.GetNetworkID()
 
+	prioritizeReason := fmt.Sprintf("prioritize-reason-%s", prng.HexString(8))
+	prioritizeTunnelProtocol := tunnelProtocol
+
 	err = datastoreUpdate(func(tx *datastoreTx) error {
 		return dslPrioritizeDialServerEntry(
-			tx, networkID, []byte(serverEntries[1].IpAddress))
+			tx,
+			networkID,
+			[]byte(serverEntries[1].IpAddress),
+			prioritizeReason,
+			prioritizeTunnelProtocol)
 	})
 	if err != nil {
 		t.Fatalf("dslPrioritizeDialServerEntry failed: %s", err)
@@ -829,8 +837,14 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		t.Fatalf("MakeDialParameters failed: %s", err)
 	}
 
-	if !dialParams.DSLPendingPrioritizeDialTimestamp.IsZero() || !dialParams.DSLPrioritizedDial {
+	if !dialParams.DSLPendingPrioritizeDialTimestamp.IsZero() ||
+		!dialParams.DSLPrioritizedDial ||
+		dialParams.DSLPrioritizedDialReason != prioritizeReason ||
+		dialParams.DSLPrioritizedTunnelProtocol != prioritizeTunnelProtocol {
 		t.Fatalf("unexpected DSL prioritize state")
+	}
+	if dialParams.TunnelProtocol != prioritizeTunnelProtocol {
+		t.Fatalf("unexpected prioritized tunnel protocol")
 	}
 
 	if dialParams.IsReplay {
@@ -845,7 +859,10 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		t.Fatalf("MakeDialParameters failed: %s", err)
 	}
 
-	if !dialParams.DSLPendingPrioritizeDialTimestamp.IsZero() || !dialParams.DSLPrioritizedDial {
+	if !dialParams.DSLPendingPrioritizeDialTimestamp.IsZero() ||
+		!dialParams.DSLPrioritizedDial ||
+		dialParams.DSLPrioritizedDialReason != prioritizeReason ||
+		dialParams.DSLPrioritizedTunnelProtocol != prioritizeTunnelProtocol {
 		t.Fatalf("unexpected DSL prioritize state")
 	}
 
@@ -857,7 +874,11 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 	err = datastoreUpdate(func(tx *datastoreTx) error {
 		return dslPrioritizeDialServerEntry(
-			tx, networkID, []byte(serverEntries[1].IpAddress))
+			tx,
+			networkID,
+			[]byte(serverEntries[1].IpAddress),
+			prioritizeReason,
+			prioritizeTunnelProtocol)
 	})
 	if err != nil {
 		t.Fatalf("dslPrioritizeDialServerEntry failed: %s", err)
@@ -869,7 +890,10 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		t.Fatalf("MakeDialParameters failed: %s", err)
 	}
 
-	if !dialParams.DSLPendingPrioritizeDialTimestamp.IsZero() || !dialParams.DSLPrioritizedDial {
+	if !dialParams.DSLPendingPrioritizeDialTimestamp.IsZero() ||
+		!dialParams.DSLPrioritizedDial ||
+		dialParams.DSLPrioritizedDialReason != prioritizeReason ||
+		dialParams.DSLPrioritizedTunnelProtocol != prioritizeTunnelProtocol {
 		t.Fatalf("unexpected DSL prioritize state")
 	}
 
@@ -888,6 +912,8 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 	expiredPlaceholder := &DialParameters{
 		DSLPendingPrioritizeDialTimestamp: time.Now().Add(-24 * time.Hour),
+		DSLPrioritizedDialReason:          prioritizeReason,
+		DSLPrioritizedTunnelProtocol:      prioritizeTunnelProtocol,
 	}
 	err = SetDialParameters(serverEntries[2].IpAddress, networkID, expiredPlaceholder)
 	if err != nil {
@@ -901,7 +927,9 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 	}
 
 	// DSLPrioritizedDial is true even for expired placeholders...
-	if !dialParams.DSLPrioritizedDial {
+	if !dialParams.DSLPrioritizedDial ||
+		dialParams.DSLPrioritizedDialReason != prioritizeReason ||
+		dialParams.DSLPrioritizedTunnelProtocol != prioritizeTunnelProtocol {
 		t.Fatalf("unexpected DSL prioritize state")
 	}
 
@@ -916,7 +944,11 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 	err = datastoreUpdate(func(tx *datastoreTx) error {
 		return dslPrioritizeDialServerEntry(
-			tx, networkID, []byte(serverEntries[3].IpAddress))
+			tx,
+			networkID,
+			[]byte(serverEntries[3].IpAddress),
+			prioritizeReason,
+			prioritizeTunnelProtocol)
 	})
 	if err != nil {
 		t.Fatalf("dslPrioritizeDialServerEntry failed: %s", err)
@@ -928,7 +960,9 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		t.Fatalf("MakeDialParameters failed: %s", err)
 	}
 
-	if !dialParams.DSLPrioritizedDial {
+	if !dialParams.DSLPrioritizedDial ||
+		dialParams.DSLPrioritizedDialReason != prioritizeReason ||
+		dialParams.DSLPrioritizedTunnelProtocol != prioritizeTunnelProtocol {
 		t.Fatalf("unexpected DSL prioritize state")
 	}
 
@@ -958,7 +992,11 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 	err = datastoreUpdate(func(tx *datastoreTx) error {
 		return dslPrioritizeDialServerEntry(
-			tx, networkID, []byte(serverEntries[3].IpAddress))
+			tx,
+			networkID,
+			[]byte(serverEntries[3].IpAddress),
+			prioritizeReason,
+			prioritizeTunnelProtocol)
 	})
 	if err != nil {
 		t.Fatalf("dslPrioritizeDialServerEntry failed: %s", err)
@@ -978,6 +1016,40 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 	}
 	if storedDialParams == nil || storedDialParams.DSLPendingPrioritizeDialTimestamp.IsZero() {
 		t.Fatalf("expected DSL prioritize placeholder")
+	}
+
+	// Test: DSLPendingPrioritizeDial falls back to a different tunnel
+	// protocol when the prioritized tunnel protocol is unavailable.
+
+	unavailablePrioritizeTunnelProtocol := protocol.SupportedTunnelProtocols[0]
+	if unavailablePrioritizeTunnelProtocol == tunnelProtocol {
+		unavailablePrioritizeTunnelProtocol = protocol.SupportedTunnelProtocols[1]
+	}
+	err = datastoreUpdate(func(tx *datastoreTx) error {
+		return dslPrioritizeDialServerEntry(
+			tx,
+			networkID,
+			[]byte(serverEntries[4].IpAddress),
+			prioritizeReason,
+			unavailablePrioritizeTunnelProtocol)
+	})
+	if err != nil {
+		t.Fatalf("dslPrioritizeDialServerEntry failed: %s", err)
+	}
+
+	dialParams, err = MakeDialParameters(
+		clientConfig, steeringIPCache, nil, nil, nil, canReplay, selectProtocol, serverEntries[4], nil, nil, false, 0, 0)
+	if err != nil {
+		t.Fatalf("MakeDialParameters failed: %s", err)
+	}
+
+	if !dialParams.DSLPrioritizedDial ||
+		dialParams.DSLPrioritizedDialReason != prioritizeReason ||
+		dialParams.DSLPrioritizedTunnelProtocol != unavailablePrioritizeTunnelProtocol {
+		t.Fatalf("unexpected DSL prioritize state")
+	}
+	if dialParams.TunnelProtocol == unavailablePrioritizeTunnelProtocol {
+		t.Fatalf("unexpected use of unavailable prioritized tunnel protocol")
 	}
 
 	// Test: iterator shuffles
@@ -1025,7 +1097,11 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 			err := datastoreUpdate(func(tx *datastoreTx) error {
 				return dslPrioritizeDialServerEntry(
-					tx, networkID, []byte(serverEntry.IpAddress))
+					tx,
+					networkID,
+					[]byte(serverEntry.IpAddress),
+					prioritizeReason,
+					prioritizeTunnelProtocol)
 			})
 			if err != nil {
 				t.Fatalf("dslPrioritizeDialServerEntry failed: %s", err)
@@ -1036,7 +1112,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 	for i := 0; i < 5; i++ {
 
-		hasAffinity, iterator, err := NewServerEntryIterator(clientConfig)
+		hasAffinity, iterator, err := NewServerEntryIterator(ctx, clientConfig)
 		if err != nil {
 			t.Fatalf("NewServerEntryIterator failed: %s", err)
 		}
@@ -1049,7 +1125,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 		for j := 0; j < 20; j++ {
 
-			serverEntry, err := iterator.Next()
+			serverEntry, err := iterator.Next(ctx)
 			if err != nil {
 				t.Fatalf("ServerEntryIterator.Next failed: %s", err)
 			}
@@ -1065,14 +1141,14 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 			}
 		}
 
-		iterator.Reset()
+		iterator.Reset(ctx)
 
 		// Test: subsequent shuffles should not move the replay/DSL-prioritize candidates candidates
 
 		allMoveToFront := true
 		for j := 0; j < 20; j++ {
 
-			serverEntry, err := iterator.Next()
+			serverEntry, err := iterator.Next(ctx)
 			if err != nil {
 				t.Fatalf("ServerEntryIterator.Next failed: %s", err)
 			}
@@ -1103,7 +1179,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 			t.Fatalf("SetParameters failed: %s", err)
 		}
 
-		hasAffinity, iterator, err = NewServerEntryIterator(clientConfig)
+		hasAffinity, iterator, err = NewServerEntryIterator(ctx, clientConfig)
 		if err != nil {
 			t.Fatalf("NewServerEntryIterator failed: %s", err)
 		}
@@ -1114,7 +1190,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 		for j := 0; j < 5; j++ {
 
-			serverEntry, err := iterator.Next()
+			serverEntry, err := iterator.Next(ctx)
 			if err != nil {
 				t.Fatalf("ServerEntryIterator.Next failed: %s", err)
 			}
@@ -1133,7 +1209,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		allMoveToFront = true
 		for j := 5; j < 20; j++ {
 
-			serverEntry, err := iterator.Next()
+			serverEntry, err := iterator.Next(ctx)
 			if err != nil {
 				t.Fatalf("ServerEntryIterator.Next failed: %s", err)
 			}
@@ -1221,8 +1297,8 @@ func TestLimitTunnelDialPortNumbers(t *testing.T) {
 			clientConfig.GetParameters().Get().TunnelProtocolPortLists(parameters.LimitTunnelDialPortNumbers)),
 	}
 
-	selectProtocol := func(serverEntry *protocol.ServerEntry) (string, bool) {
-		protocol, _, ok := constraints.selectProtocol(0, false, false, serverEntry)
+	selectProtocol := func(serverEntry *protocol.ServerEntry, prioritizeTunnelProtocol string) (string, bool) {
+		protocol, _, ok := constraints.selectProtocol(0, false, false, prioritizeTunnelProtocol, serverEntry)
 		return protocol, ok
 	}
 
@@ -1242,7 +1318,7 @@ func TestLimitTunnelDialPortNumbers(t *testing.T) {
 
 		for _, serverEntry := range serverEntries {
 
-			selectedProtocol, ok := selectProtocol(serverEntry)
+			selectedProtocol, ok := selectProtocol(serverEntry, "")
 
 			if ok {
 

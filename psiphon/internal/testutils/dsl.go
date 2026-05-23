@@ -67,9 +67,11 @@ type DSLBackendTestShim interface {
 
 	MarshalDiscoverServerEntriesResponse(
 		versionedServerEntryTags []*struct {
-			Tag            []byte
-			Version        int32
-			PrioritizeDial bool
+			Tag                      []byte
+			Version                  int32
+			PrioritizeDial           bool
+			PrioritizeReason         string
+			PrioritizeTunnelProtocol string
 		}) (
 		cborResponse []byte,
 		retErr error)
@@ -124,9 +126,11 @@ type TestDSLBackend struct {
 }
 
 type dslSourcedServerEntry struct {
-	ServerEntryFields protocol.PackedServerEntryFields
-	Source            string
-	PrioritizeDial    bool
+	ServerEntryFields        protocol.PackedServerEntryFields
+	Source                   string
+	PrioritizeDial           bool
+	PrioritizeReason         string
+	PrioritizeTunnelProtocol string
 }
 
 func NewTestDSLBackend(
@@ -206,11 +210,19 @@ func NewTestDSLBackend(
 				return errors.TraceNew("duplicate tag")
 			}
 
-			serverEntries[serverEntry.Tag] = &dslSourcedServerEntry{
+			sourcedServerEntry := &dslSourcedServerEntry{
 				ServerEntryFields: packed,
 				Source:            source,
 				PrioritizeDial:    prng.FlipCoin(),
 			}
+			if sourcedServerEntry.PrioritizeDial {
+				sourcedServerEntry.PrioritizeReason =
+					fmt.Sprintf("prioritize-reason-%s", prng.HexString(8))
+				sourcedServerEntry.PrioritizeTunnelProtocol =
+					protocol.TUNNEL_PROTOCOL_OBFUSCATED_SSH
+			}
+
+			serverEntries[serverEntry.Tag] = sourcedServerEntry
 
 			initMutex.Unlock()
 
@@ -377,22 +389,27 @@ func (b *TestDSLBackend) GetServerEntryCount(isTunneled bool) int {
 }
 
 func (b *TestDSLBackend) GetServerEntryProperties(
-	serverEntryTag string) (string, bool, error) {
+	serverEntryTag string) (string, bool, string, string, error) {
 
 	entry, ok := b.untunneledServerEntries[serverEntryTag]
 	if !ok {
 		entry, ok = b.tunneledServerEntries[serverEntryTag]
 		if !ok {
-			return "", false, errors.TraceNew("unknown server entry tag")
+			return "", false, "", "", errors.TraceNew("unknown server entry tag")
 		}
 	}
 
-	return entry.Source, entry.PrioritizeDial, nil
+	return entry.Source,
+		entry.PrioritizeDial,
+		entry.PrioritizeReason,
+		entry.PrioritizeTunnelProtocol,
+		nil
 }
 
 func (b *TestDSLBackend) SetServerEntries(
 	isTunneled bool,
 	prioritizeDial bool,
+	prioritizeTunnelProtocol string,
 	encodedServerEntries []string) error {
 
 	source := "DSL-untunneled"
@@ -412,11 +429,18 @@ func (b *TestDSLBackend) SetServerEntries(
 		if err != nil {
 			return errors.Trace(err)
 		}
-		sourcedServerEntries[serverEntryFields.GetTag()] = &dslSourcedServerEntry{
+		sourcedServerEntry := &dslSourcedServerEntry{
 			ServerEntryFields: packedServerEntryFields,
 			Source:            source,
 			PrioritizeDial:    prioritizeDial,
 		}
+		if prioritizeDial {
+			sourcedServerEntry.PrioritizeReason =
+				fmt.Sprintf("prioritize-reason-%s", prng.HexString(8))
+			sourcedServerEntry.PrioritizeTunnelProtocol =
+				prioritizeTunnelProtocol
+		}
+		sourcedServerEntries[serverEntryFields.GetTag()] = sourcedServerEntry
 	}
 
 	if isTunneled {
@@ -473,9 +497,11 @@ func (b *TestDSLBackend) handleDiscoverServerEntries(
 	}
 
 	var versionedServerEntryTags []*struct {
-		Tag            []byte
-		Version        int32
-		PrioritizeDial bool
+		Tag                      []byte
+		Version                  int32
+		PrioritizeDial           bool
+		PrioritizeReason         string
+		PrioritizeTunnelProtocol string
 	}
 
 	if !missingOSLs {
@@ -496,10 +522,17 @@ func (b *TestDSLBackend) handleDiscoverServerEntries(
 			versionedServerEntryTags = append(
 				versionedServerEntryTags,
 				&struct {
-					Tag            []byte
-					Version        int32
-					PrioritizeDial bool
-				}{serverEntryTag, 0, sourcedServerEntry.PrioritizeDial})
+					Tag                      []byte
+					Version                  int32
+					PrioritizeDial           bool
+					PrioritizeReason         string
+					PrioritizeTunnelProtocol string
+				}{serverEntryTag,
+					0,
+					sourcedServerEntry.PrioritizeDial,
+					sourcedServerEntry.PrioritizeReason,
+					sourcedServerEntry.PrioritizeTunnelProtocol,
+				})
 		}
 	}
 

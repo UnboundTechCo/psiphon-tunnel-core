@@ -275,6 +275,11 @@ typedef NS_ERROR_ENUM(PsiphonTunnelErrorDomain, PsiphonTunnelErrorCode) {
     return [self start];
 }
 
+// See comment in header
+- (void)appResumed {
+    GoPsiAppResumed();
+}
+
 /*!
  Start the tunnel. If the tunnel is already started it will be stopped first.
  Assumes self.sessionID has been initialized -- i.e., assumes that
@@ -459,6 +464,11 @@ typedef NS_ERROR_ENUM(PsiphonTunnelErrorDomain, PsiphonTunnelErrorCode) {
 // See comment in header.
 - (long)getPacketTunnelMTU {
     return GoPsiGetPacketTunnelMTU();
+}
+
+// See comment in header.
+- (BOOL)importPushPayload:(NSData * _Nonnull)payload {
+    return GoPsiImportPushPayload(payload);
 }
 
 // See comment in header.
@@ -1191,6 +1201,9 @@ typedef NS_ERROR_ENUM(PsiphonTunnelErrorDomain, PsiphonTunnelErrorCode) {
         }
     }
     else if ([noticeType isEqualToString:@"InproxyProxyActivity"]) {
+        // TODO: Parse and forward personalRegionActivity and
+        // commonRegionActivity. This should be done when the conduit iOS app
+        // supports the tunnel functionality correctly
         id announcing = [notice valueForKeyPath:@"data.announcing"];
         id connectingClients = [notice valueForKeyPath:@"data.connectingClients"];
         id connectedClients = [notice valueForKeyPath:@"data.connectedClients"];

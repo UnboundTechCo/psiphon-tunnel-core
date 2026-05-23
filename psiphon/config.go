@@ -31,6 +31,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -255,6 +256,11 @@ type Config struct {
 	// attempt in parallel. If omitted or when 0, a default is used; this is
 	// recommended.
 	ConnectionWorkerPoolSize int `json:",omitempty"`
+
+	// ConnectionWorkerPoolMaxSize specifies a cap for ConnectionWorkerPoolSize
+	// that will not be exceeded by any tactics setting. This is intended for
+	// use in low memory environments. If omitted or when 0, it has no effect.
+	ConnectionWorkerPoolMaxSize int `json:",omitempty"`
 
 	// DisableConnectionWorkerPool forces ConnectionWorkerPoolSize to 0; this
 	// may be used to load cached tactics or perform an untunneled tactics
@@ -668,9 +674,33 @@ type Config struct {
 	// ephemeral key will be generated.
 	InproxyProxySessionPrivateKey string `json:",omitempty"`
 
-	// InproxyMaxClients specifies the maximum number of in-proxy clients to
-	// be proxied concurrently. Must be > 0 when InproxyEnableProxy is set.
+	// InproxyProxySplitUpstreamInterfaceName specifies a network interface
+	// that the in-proxy proxy will use for upstream destination dialing. The
+	// specified interface is also excluded from proxy ICE gathering. This is
+	// intended to support split interface setups with the proxy/client
+	// connection on the default interface and the proxy/server connection on
+	// the designated interface.
+	//
+	// Only supported on Linux, and cannot be used with DeviceBinder.
+	InproxyProxySplitUpstreamInterfaceName string `json:",omitempty"`
+
+	// InproxyMaxClients specifies the maximum number of common in-proxy
+	// clients to be proxied concurrently. When InproxyEnableProxy is set,
+	// it can only be 0 when InProxyMaxPersonalClients is > 0.
+	//
+	// Deprecated: Use InproxyMaxCommonClients. When InproxyMaxCommonClients
+	// is not nil, this parameter is ignored.
 	InproxyMaxClients int `json:",omitempty"`
+
+	// InproxyMaxCommonClients specifies the maximum number of common
+	// in-proxy clients to be proxied concurrently. When InproxyEnableProxy
+	// is set, it can only be 0 when InProxyMaxPersonalClients is > 0.
+	InproxyMaxCommonClients int `json:",omitempty"`
+
+	// InproxyMaxPersonalClients specifies the maximum number of personal
+	// in-proxy clients to be proxied concurrently. When InproxyEnableProxy
+	// is set, it can only be 0 when InProxyMaxCommonClients is > 0.
+	InproxyMaxPersonalClients int `json:",omitempty"`
 
 	// InproxyLimitUpstreamBytesPerSecond specifies the upstream byte transfer
 	// rate limit for each proxied client. When 0, there is no limit.
@@ -688,13 +718,25 @@ type Config struct {
 	// UTC) at which reduced in-proxy settings end.
 	InproxyReducedEndTime string `json:",omitempty"`
 
-	// InproxyReducedMaxClients specifies the maximum number of in-proxy
-	// clients to be proxied concurrently during the reduced time range.
-	// When set, must be > 0 and <= InproxyMaxClients.
+	// InproxyReducedMaxClients specifies the maximum number of common
+	// in-proxy clients to be proxied concurrently during the reduced
+	// time range. When set, must be > 0 and <= InproxyMaxCommonClients.
 	//
 	// Clients connected when the reduced settings begin will not be
 	// disconnected, so InproxyReducedMaxClients is a soft limit.
+	//
+	// Deprecated: Use InproxyReducedMaxCommon Clients. When
+	// InproxyMaxCommonClients is not nil, this parameter is ignored.
 	InproxyReducedMaxClients int `json:",omitempty"`
+
+	// InproxyReducedMaxCommonClients specifies the maximum number of
+	// common in-proxy clients to be proxied concurrently during the
+	// reduced time range. When set, must be > 0 and
+	// <= InproxyMaxCommonClients.
+	//
+	// Clients connected when the reduced settings begin will not be
+	// disconnected, so InproxyReducedMaxCommonClients is a soft limit.
+	InproxyReducedMaxCommonClients int `json:",omitempty"`
 
 	// InproxyReducedLimitUpstreamBytesPerSecond specifies the upstream byte
 	// transfer rate limit for each proxied client during the reduced time
@@ -775,6 +817,37 @@ type Config struct {
 	// EnableDSLFetcher tactics parameter. This may be used for special case
 	// temporary tunnels.
 	DisableDSLFetcher bool `json:",omitempty"`
+
+	// PushPayloadObfuscationKey is a base64-encoded, secret key value used to
+	// deobfuscate push payloads. This value is supplied by the Psiphon
+	// Network. Required for push payload imports.
+	PushPayloadObfuscationKey string `json:",omitempty"`
+
+	// PushPayloadSignaturePublicKey is a base64-encoded, public key value
+	// used to verify push payloads. This value is supplied by the Psiphon
+	// Network. Required for push payload imports.
+	PushPayloadSignaturePublicKey string `json:",omitempty"`
+
+	// EnableProxyProtocolHeaders is an optional parameter that is passed to
+	// the Psiphon server to explicitly opt-in or opt-out of HAProxy PROXY
+	// protocol headers added to port forwards, as configured on the server.
+	EnableProxyProtocolHeaders *bool `json:",omitempty"`
+
+	// SSHChannelWindowSize specifies the SSH channel window size, in terms of
+	// number of maximum sized 32K SSH packets. The valid range is 1-128.
+	// When 0, the default of 4 is used.
+	SSHChannelWindowSize *int `json:",omitempty"`
+
+	// SSHPacketTunnelChannelWindowSize specifies the packet tunnel mode SSH
+	// channel window size, in terms of number of maximum sized 32K SSH
+	// packets. The valid range is 1-128. When 0, the default of 16 is used.
+	SSHPacketTunnelChannelWindowSize *int `json:",omitempty"`
+
+	// DisableServerEntriesReporter disables the server entry scan that
+	// reports the AvailableEgressRegions notice, as well as CandidateServers
+	// diagnostics. When the egress region list is not required, disabling
+	// this expensive scan can improve datastore performance on slower devices.
+	DisableServerEntriesReporter *bool `json:",omitempty"`
 
 	//
 	// The following parameters are deprecated.
@@ -881,6 +954,8 @@ type Config struct {
 	// TransformHostNameProbability is for testing purposes.
 	TransformHostNameProbability *float64 `json:",omitempty"`
 
+	PickUserAgentProbability *float64 `json:",omitempty"`
+
 	// FragmentorProbability and associated Fragmentor fields are for testing
 	// purposes.
 	FragmentorProbability          *float64 `json:",omitempty"`
@@ -903,6 +978,10 @@ type Config struct {
 	MeekRedialTLSProbability            *float64 `json:",omitempty"`
 	MeekAlternateCookieNameProbability  *float64 `json:",omitempty"`
 	MeekAlternateContentTypeProbability *float64 `json:",omitempty"`
+	MeekPayloadPaddingProbability       *float64 `json:",omitempty"`
+	MeekPayloadPaddingMinSize           *int     `json:",omitempty"`
+	MeekPayloadPaddingMaxSize           *int     `json:",omitempty"`
+	MeekPayloadPaddingOmitProbability   *float64 `json:",omitempty"`
 
 	// ObfuscatedSSHAlgorithms and associated ObfuscatedSSH fields are for
 	// testing purposes. If specified, ObfuscatedSSHAlgorithms must have 4 SSH
@@ -920,6 +999,21 @@ type Config struct {
 	LivenessTestMaxUpstreamBytes   *int                         `json:",omitempty"`
 	LivenessTestMinDownstreamBytes *int                         `json:",omitempty"`
 	LivenessTestMaxDownstreamBytes *int                         `json:",omitempty"`
+
+	SSHKeepAliveSpeedTestSampleProbability                   *float64 `json:",omitempty"`
+	SSHKeepAlivePaddingMinBytes                              *int     `json:",omitempty"`
+	SSHKeepAlivePaddingMaxBytes                              *int     `json:",omitempty"`
+	SSHKeepAlivePeriodMinMilliseconds                        *int     `json:",omitempty"`
+	SSHKeepAlivePeriodMaxMilliseconds                        *int     `json:",omitempty"`
+	SSHKeepAlivePeriodicTimeoutMilliseconds                  *int     `json:",omitempty"`
+	SSHKeepAlivePeriodicInactivePeriodMilliseconds           *int     `json:",omitempty"`
+	SSHKeepAliveProbeTimeoutMilliseconds                     *int     `json:",omitempty"`
+	SSHKeepAliveProbeInactivePeriodMilliseconds              *int     `json:",omitempty"`
+	SSHKeepAliveNetworkConnectivityPollingPeriodMilliseconds *int     `json:",omitempty"`
+	SSHKeepAliveResetOnFailureProbability                    *float64 `json:",omitempty"`
+	SSHKeepAliveResumeProbeTimeoutMilliseconds               *int     `json:",omitempty"`
+	SSHKeepAliveResumeProbeInactivePeriodMilliseconds        *int     `json:",omitempty"`
+	SSHKeepAliveResumeReconnectInactivePeriodMilliseconds    *int     `json:",omitempty"`
 
 	// ReplayCandidateCount and other Replay fields are for testing purposes.
 	ReplayCandidateCount                      *int     `json:",omitempty"`
@@ -1120,6 +1214,7 @@ type Config struct {
 	InproxyPersonalPairingBrokerSpecs                       parameters.InproxyBrokerSpecsValue               `json:",omitempty"`
 	InproxyProxyBrokerSpecs                                 parameters.InproxyBrokerSpecsValue               `json:",omitempty"`
 	InproxyProxyPersonalPairingBrokerSpecs                  parameters.InproxyBrokerSpecsValue               `json:",omitempty"`
+	InproxyPersonalPairingMaxBrokerSpecCount                *int                                             `json:",omitempty"`
 	InproxyClientBrokerSpecs                                parameters.InproxyBrokerSpecsValue               `json:",omitempty"`
 	InproxyClientPersonalPairingBrokerSpecs                 parameters.InproxyBrokerSpecsValue               `json:",omitempty"`
 	InproxyReplayBrokerDialParametersTTLSeconds             *int                                             `json:",omitempty"`
@@ -1184,9 +1279,8 @@ type Config struct {
 	InproxyClientDisableWaitToShareSession                  *bool                                            `json:",omitempty"`
 	InproxyTunnelProtocolPreferProbability                  *float64                                         `json:",omitempty"`
 	InproxyTunnelProtocolForceSelectionCount                *int                                             `json:",omitempty"`
-
-	InproxySkipAwaitFullyConnected  bool `json:",omitempty"`
-	InproxyEnableWebRTCDebugLogging bool `json:",omitempty"`
+	InproxySkipAwaitFullyConnected                          bool                                             `json:",omitempty"`
+	InproxyEnableWebRTCDebugLogging                         bool                                             `json:",omitempty"`
 
 	NetworkIDCacheTTLMilliseconds *int `json:",omitempty"`
 
@@ -1200,6 +1294,8 @@ type Config struct {
 
 	ServerEntryIteratorMaxMoveToFront   *int     `json:",omitempty"`
 	ServerEntryIteratorResetProbability *float64 `json:",omitempty"`
+
+	TunnelConnectTimeoutSeconds *int `json:",omitempty"`
 
 	// params is the active parameters.Parameters with defaults, config values,
 	// and, optionally, tactics applied.
@@ -1468,6 +1564,14 @@ func (config *Config) Commit(migrateFromLegacyFields bool) error {
 		config.MigrateUpgradeDownloadFilename = config.UpgradeDownloadFilename
 	}
 
+	if config.InproxyMaxClients != 0 && config.InproxyMaxCommonClients == 0 {
+		config.InproxyMaxCommonClients = config.InproxyMaxClients
+	}
+
+	if config.InproxyReducedMaxClients != 0 && config.InproxyReducedMaxCommonClients == 0 {
+		config.InproxyReducedMaxCommonClients = config.InproxyReducedMaxClients
+	}
+
 	// Supply default values.
 
 	// Create datastore directory.
@@ -1569,15 +1673,26 @@ func (config *Config) Commit(migrateFromLegacyFields bool) error {
 		return errors.TraceNew("invalid ObfuscatedSSHAlgorithms")
 	}
 
+	if config.InproxyProxySplitUpstreamInterfaceName != "" && runtime.GOOS != "linux" {
+		return errors.TraceNew("InproxyProxySplitUpstreamInterfaceName is only supported on Linux")
+	}
+	if config.InproxyProxySplitUpstreamInterfaceName != "" && config.DeviceBinder != nil {
+		return errors.TraceNew("InproxyProxySplitUpstreamInterfaceName cannot be used with DeviceBinder")
+	}
+
 	if config.InproxyEnableProxy {
 
-		if config.InproxyMaxClients <= 0 {
-			return errors.TraceNew("invalid InproxyMaxClients")
+		if config.InproxyMaxCommonClients+config.InproxyMaxPersonalClients <= 0 {
+			return errors.TraceNew("invalid InproxyMaxCommonClients and InproxyMaxPersonalClients")
+		}
+
+		if len(config.InproxyProxyPersonalCompartmentID) > 0 && config.InproxyMaxPersonalClients <= 0 {
+			return errors.TraceNew("invalid InproxyMaxPersonalClients when personal compartment IDs are provided")
 		}
 
 		if config.InproxyReducedStartTime != "" ||
 			config.InproxyReducedEndTime != "" ||
-			config.InproxyReducedMaxClients > 0 {
+			config.InproxyReducedMaxCommonClients > 0 {
 
 			startMinute, err := common.ParseTimeOfDayMinutes(config.InproxyReducedStartTime)
 			if err != nil {
@@ -1594,9 +1709,9 @@ func (config *Config) Commit(migrateFromLegacyFields bool) error {
 				return errors.TraceNew("invalid InproxyReducedStartTime/InproxyReducedEndTime")
 			}
 
-			if config.InproxyReducedMaxClients <= 0 ||
-				config.InproxyReducedMaxClients > config.InproxyMaxClients {
-				return errors.TraceNew("invalid InproxyReducedMaxClients")
+			if config.InproxyReducedMaxCommonClients <= 0 ||
+				config.InproxyReducedMaxCommonClients > config.InproxyMaxCommonClients {
+				return errors.TraceNew("invalid InproxyReducedMaxCommonClients")
 			}
 
 			// InproxyReducedLimitUpstream/DownstreamBytesPerSecond don't necessarily
@@ -1626,7 +1741,7 @@ func (config *Config) Commit(migrateFromLegacyFields bool) error {
 		!inproxy.Enabled() {
 
 		// When in-proxy personal pairing mode is on, fail if the build was
-		// made without the PSIPHON_ENABLE_INPROXY build tag.
+		// made with the PSIPHON_DISABLE_INPROXY build tag.
 		//
 		// Note that this check could also be enforced in the case of a
 		// LimitTunnelProtocols.IsOnlyInproxyTunnelProtocols configuration,
@@ -2218,6 +2333,10 @@ func (config *Config) makeConfigParameters() map[string]interface{} {
 		applyParameters[parameters.TransformHostNameProbability] = *config.TransformHostNameProbability
 	}
 
+	if config.PickUserAgentProbability != nil {
+		applyParameters[parameters.PickUserAgentProbability] = *config.PickUserAgentProbability
+	}
+
 	if config.FragmentorProbability != nil {
 		applyParameters[parameters.FragmentorProbability] = *config.FragmentorProbability
 	}
@@ -2286,6 +2405,22 @@ func (config *Config) makeConfigParameters() map[string]interface{} {
 		applyParameters[parameters.MeekAlternateContentTypeProbability] = *config.MeekAlternateContentTypeProbability
 	}
 
+	if config.MeekPayloadPaddingProbability != nil {
+		applyParameters[parameters.MeekPayloadPaddingProbability] = *config.MeekPayloadPaddingProbability
+	}
+
+	if config.MeekPayloadPaddingMinSize != nil {
+		applyParameters[parameters.MeekPayloadPaddingClientMinSize] = *config.MeekPayloadPaddingMinSize
+	}
+
+	if config.MeekPayloadPaddingMaxSize != nil {
+		applyParameters[parameters.MeekPayloadPaddingClientMaxSize] = *config.MeekPayloadPaddingMaxSize
+	}
+
+	if config.MeekPayloadPaddingOmitProbability != nil {
+		applyParameters[parameters.MeekPayloadPaddingClientOmitProbability] = *config.MeekPayloadPaddingOmitProbability
+	}
+
 	if config.ObfuscatedSSHMinPadding != nil {
 		applyParameters[parameters.ObfuscatedSSHMinPadding] = *config.ObfuscatedSSHMinPadding
 	}
@@ -2316,6 +2451,62 @@ func (config *Config) makeConfigParameters() map[string]interface{} {
 
 	if config.LivenessTestMaxDownstreamBytes != nil {
 		applyParameters[parameters.LivenessTestMaxDownstreamBytes] = *config.LivenessTestMaxDownstreamBytes
+	}
+
+	if config.SSHKeepAliveSpeedTestSampleProbability != nil {
+		applyParameters[parameters.SSHKeepAliveSpeedTestSampleProbability] = *config.SSHKeepAliveSpeedTestSampleProbability
+	}
+
+	if config.SSHKeepAlivePaddingMinBytes != nil {
+		applyParameters[parameters.SSHKeepAlivePaddingMinBytes] = *config.SSHKeepAlivePaddingMinBytes
+	}
+
+	if config.SSHKeepAlivePaddingMaxBytes != nil {
+		applyParameters[parameters.SSHKeepAlivePaddingMaxBytes] = *config.SSHKeepAlivePaddingMaxBytes
+	}
+
+	if config.SSHKeepAlivePeriodMinMilliseconds != nil {
+		applyParameters[parameters.SSHKeepAlivePeriodMin] = fmt.Sprintf("%dms", *config.SSHKeepAlivePeriodMinMilliseconds)
+	}
+
+	if config.SSHKeepAlivePeriodMaxMilliseconds != nil {
+		applyParameters[parameters.SSHKeepAlivePeriodMax] = fmt.Sprintf("%dms", *config.SSHKeepAlivePeriodMaxMilliseconds)
+	}
+
+	if config.SSHKeepAlivePeriodicTimeoutMilliseconds != nil {
+		applyParameters[parameters.SSHKeepAlivePeriodicTimeout] = fmt.Sprintf("%dms", *config.SSHKeepAlivePeriodicTimeoutMilliseconds)
+	}
+
+	if config.SSHKeepAlivePeriodicInactivePeriodMilliseconds != nil {
+		applyParameters[parameters.SSHKeepAlivePeriodicInactivePeriod] = fmt.Sprintf("%dms", *config.SSHKeepAlivePeriodicInactivePeriodMilliseconds)
+	}
+
+	if config.SSHKeepAliveProbeTimeoutMilliseconds != nil {
+		applyParameters[parameters.SSHKeepAliveProbeTimeout] = fmt.Sprintf("%dms", *config.SSHKeepAliveProbeTimeoutMilliseconds)
+	}
+
+	if config.SSHKeepAliveProbeInactivePeriodMilliseconds != nil {
+		applyParameters[parameters.SSHKeepAliveProbeInactivePeriod] = fmt.Sprintf("%dms", *config.SSHKeepAliveProbeInactivePeriodMilliseconds)
+	}
+
+	if config.SSHKeepAliveNetworkConnectivityPollingPeriodMilliseconds != nil {
+		applyParameters[parameters.SSHKeepAliveNetworkConnectivityPollingPeriod] = fmt.Sprintf("%dms", *config.SSHKeepAliveNetworkConnectivityPollingPeriodMilliseconds)
+	}
+
+	if config.SSHKeepAliveResetOnFailureProbability != nil {
+		applyParameters[parameters.SSHKeepAliveResetOnFailureProbability] = *config.SSHKeepAliveResetOnFailureProbability
+	}
+
+	if config.SSHKeepAliveResumeProbeTimeoutMilliseconds != nil {
+		applyParameters[parameters.SSHKeepAliveResumeProbeTimeout] = fmt.Sprintf("%dms", *config.SSHKeepAliveResumeProbeTimeoutMilliseconds)
+	}
+
+	if config.SSHKeepAliveResumeProbeInactivePeriodMilliseconds != nil {
+		applyParameters[parameters.SSHKeepAliveResumeProbeInactivePeriod] = fmt.Sprintf("%dms", *config.SSHKeepAliveResumeProbeInactivePeriodMilliseconds)
+	}
+
+	if config.SSHKeepAliveResumeReconnectInactivePeriodMilliseconds != nil {
+		applyParameters[parameters.SSHKeepAliveResumeReconnectInactivePeriod] = fmt.Sprintf("%dms", *config.SSHKeepAliveResumeReconnectInactivePeriodMilliseconds)
 	}
 
 	if config.ReplayCandidateCount != nil {
@@ -2802,6 +2993,10 @@ func (config *Config) makeConfigParameters() map[string]interface{} {
 		applyParameters[parameters.InproxyProxyPersonalPairingBrokerSpecs] = config.InproxyProxyPersonalPairingBrokerSpecs
 	}
 
+	if config.InproxyPersonalPairingMaxBrokerSpecCount != nil {
+		applyParameters[parameters.InproxyPersonalPairingMaxBrokerSpecCount] = *config.InproxyPersonalPairingMaxBrokerSpecCount
+	}
+
 	if len(config.InproxyClientBrokerSpecs) > 0 {
 		applyParameters[parameters.InproxyClientBrokerSpecs] = config.InproxyClientBrokerSpecs
 	}
@@ -3087,11 +3282,31 @@ func (config *Config) makeConfigParameters() map[string]interface{} {
 	}
 
 	if config.ServerEntryIteratorMaxMoveToFront != nil {
+		applyParameters[parameters.ServerEntryIteratorMaxMoveToFront] = *config.ServerEntryIteratorMaxMoveToFront
+	}
+
+	if config.ServerEntryIteratorResetProbability != nil {
 		applyParameters[parameters.ServerEntryIteratorResetProbability] = *config.ServerEntryIteratorResetProbability
 	}
 
 	if config.EnableDSLFetcher != nil {
 		applyParameters[parameters.EnableDSLFetcher] = *config.EnableDSLFetcher
+	}
+
+	if config.TunnelConnectTimeoutSeconds != nil {
+		applyParameters[parameters.TunnelConnectTimeout] = fmt.Sprintf("%ds", *config.TunnelConnectTimeoutSeconds)
+	}
+
+	if config.SSHChannelWindowSize != nil {
+		applyParameters[parameters.SSHChannelWindowSize] = *config.SSHChannelWindowSize
+	}
+
+	if config.SSHPacketTunnelChannelWindowSize != nil {
+		applyParameters[parameters.SSHPacketTunnelChannelWindowSize] = *config.SSHPacketTunnelChannelWindowSize
+	}
+
+	if config.DisableServerEntriesReporter != nil {
+		applyParameters[parameters.DisableServerEntriesReporter] = *config.DisableServerEntriesReporter
 	}
 
 	// When adding new config dial parameters that may override tactics, also
@@ -3172,6 +3387,11 @@ func (config *Config) setDialParametersHash() {
 		binary.Write(hash, binary.LittleEndian, *config.TransformHostNameProbability)
 	}
 
+	if config.PickUserAgentProbability != nil {
+		hash.Write([]byte("PickUserAgentProbability"))
+		binary.Write(hash, binary.LittleEndian, *config.PickUserAgentProbability)
+	}
+
 	if config.FragmentorProbability != nil {
 		hash.Write([]byte("FragmentorProbability"))
 		binary.Write(hash, binary.LittleEndian, *config.FragmentorProbability)
@@ -3239,6 +3459,36 @@ func (config *Config) setDialParametersHash() {
 	if config.MeekRedialTLSProbability != nil {
 		hash.Write([]byte("MeekRedialTLSProbability"))
 		binary.Write(hash, binary.LittleEndian, *config.MeekRedialTLSProbability)
+	}
+
+	if config.MeekAlternateCookieNameProbability != nil {
+		hash.Write([]byte("MeekAlternateCookieNameProbability"))
+		binary.Write(hash, binary.LittleEndian, *config.MeekAlternateCookieNameProbability)
+	}
+
+	if config.MeekAlternateContentTypeProbability != nil {
+		hash.Write([]byte("MeekAlternateContentTypeProbability"))
+		binary.Write(hash, binary.LittleEndian, *config.MeekAlternateContentTypeProbability)
+	}
+
+	if config.MeekPayloadPaddingProbability != nil {
+		hash.Write([]byte("MeekPayloadPaddingProbability"))
+		binary.Write(hash, binary.LittleEndian, *config.MeekPayloadPaddingProbability)
+	}
+
+	if config.MeekPayloadPaddingMinSize != nil {
+		hash.Write([]byte("MeekPayloadPaddingMinSize"))
+		binary.Write(hash, binary.LittleEndian, int64(*config.MeekPayloadPaddingMinSize))
+	}
+
+	if config.MeekPayloadPaddingMaxSize != nil {
+		hash.Write([]byte("MeekPayloadPaddingMaxSize"))
+		binary.Write(hash, binary.LittleEndian, int64(*config.MeekPayloadPaddingMaxSize))
+	}
+
+	if config.MeekPayloadPaddingOmitProbability != nil {
+		hash.Write([]byte("MeekPayloadPaddingOmitProbability"))
+		binary.Write(hash, binary.LittleEndian, *config.MeekPayloadPaddingOmitProbability)
 	}
 
 	if config.ObfuscatedSSHMinPadding != nil {
@@ -3823,6 +4073,10 @@ func (config *Config) setDialParametersHash() {
 	if len(config.InproxyProxyPersonalPairingBrokerSpecs) > 0 {
 		hash.Write([]byte("InproxyProxyPersonalPairingBrokerSpecs"))
 		hash.Write([]byte(fmt.Sprintf("%+v", config.InproxyProxyPersonalPairingBrokerSpecs)))
+	}
+	if config.InproxyPersonalPairingMaxBrokerSpecCount != nil {
+		hash.Write([]byte("InproxyPersonalPairingMaxBrokerSpecCount"))
+		binary.Write(hash, binary.LittleEndian, int64(*config.InproxyPersonalPairingMaxBrokerSpecCount))
 	}
 	if len(config.InproxyClientBrokerSpecs) > 0 {
 		hash.Write([]byte("InproxyClientBrokerSpecs"))

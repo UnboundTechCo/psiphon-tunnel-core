@@ -156,6 +156,16 @@ func (serverContext *ServerContext) doHandshakeRequest(ignoreStatsRegexps bool) 
 			serverContext.tunnel.dialParams.ServerEntry.Tag
 	}
 
+	// When specified, send the client's HAProxy PROXY protocol header opt-in
+	// or opt-out to the server.
+	if serverContext.tunnel.config.EnableProxyProtocolHeaders != nil {
+		enabled := "0"
+		if *serverContext.tunnel.config.EnableProxyProtocolHeaders {
+			enabled = "1"
+		}
+		params["enable_proxy_protocol_headers"] = enabled
+	}
+
 	doTactics := !serverContext.tunnel.config.DisableTactics
 
 	compressTactics := false
@@ -1212,14 +1222,17 @@ func getBaseAPIParameters(
 			params["meek_host_header"] = dialParams.MeekHostHeader
 		}
 
-		// MeekTransformedHostName is meaningful when meek is used, which is when
+		// These fields are meaningful when meek is used, which is when
 		// MeekDialAddress != ""
 		if dialParams.MeekDialAddress != "" {
+
 			transformedHostName := "0"
 			if dialParams.MeekTransformedHostName {
 				transformedHostName = "1"
 			}
 			params["meek_transformed_host_name"] = transformedHostName
+
+			// meek_payload_padding is logged by the server
 		}
 
 		if dialParams.TLSOSSHSNIServerName != "" {
@@ -1291,6 +1304,12 @@ func getBaseAPIParameters(
 
 		if dialParams.DSLPrioritizedDial {
 			params["dsl_prioritized"] = "1"
+			if len(dialParams.DSLPrioritizedDialReason) > 0 {
+				params["dsl_prioritized_reason"] = dialParams.DSLPrioritizedDialReason
+			}
+			if dialParams.DSLPrioritizedTunnelProtocol != "" {
+				params["dsl_prioritized_tunnel_protocol"] = dialParams.DSLPrioritizedTunnelProtocol
+			}
 		}
 
 		// dialParams.DialDuration is nanoseconds; report milliseconds

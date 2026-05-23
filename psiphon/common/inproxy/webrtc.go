@@ -1,4 +1,4 @@
-//go:build PSIPHON_ENABLE_INPROXY
+//go:build !PSIPHON_DISABLE_INPROXY
 
 /*
  * Copyright (c) 2023, Psiphon Inc.
@@ -152,6 +152,10 @@ type webRTCConfig struct {
 	// events. When enabled, these events will be logged to the specified
 	// Logger at a Debug log level.
 	EnableDebugLogging bool
+
+	// ExcludeInterfaceName specifies the interface name to omit from ICE
+	// interface enumeration.
+	ExcludeInterfaceName string
 
 	// WebRTCDialCoordinator specifies specific WebRTC dial strategies and
 	// settings; WebRTCDialCoordinator also facilities dial replay by
@@ -351,7 +355,10 @@ func newWebRTCConn(
 		config.EnableDebugLogging)
 
 	pionNetwork := newPionNetwork(
-		ctx, pionLoggerFactory.NewLogger("net"), config.WebRTCDialCoordinator)
+		ctx,
+		pionLoggerFactory.NewLogger("net"),
+		config.WebRTCDialCoordinator,
+		config.ExcludeInterfaceName)
 
 	udpMux := webrtc.NewICEUniversalUDPMux(
 		pionLoggerFactory.NewLogger("mux"), udpConn, TTL, pionNetwork)
@@ -901,6 +908,7 @@ func newWebRTCConn(
 				[]byte(peerSDP.SDP),
 				errorOnNoCandidates,
 				nil,
+				false,
 				common.GeoIPData{},
 				allowPrivateIPAddressCandidates,
 				filterPrivateIPAddressCandidates)
@@ -1112,6 +1120,7 @@ func (conn *webRTCConn) SetRemoteSDP(
 			[]byte(peerSDP.SDP),
 			errorOnNoCandidates,
 			nil,
+			false,
 			common.GeoIPData{},
 			allowPrivateIPAddressCandidates,
 			filterPrivateIPAddressCandidates)
@@ -2752,10 +2761,11 @@ func prepareSDPAddresses(
 		errorOnNoCandidates,
 		portMappingExternalAddr,
 		disableIPv6Candidates,
-		allowPrivateIPAddressCandidates,
-		false,
 		nil,
-		common.GeoIPData{})
+		false,
+		common.GeoIPData{},
+		allowPrivateIPAddressCandidates,
+		false)
 	return modifiedSDP, metrics, errors.Trace(err)
 }
 
@@ -2767,6 +2777,7 @@ func filterSDPAddresses(
 	encodedSDP []byte,
 	errorOnNoCandidates bool,
 	lookupGeoIP LookupGeoIP,
+	allowGeoIPMismatchCandidates bool,
 	expectedGeoIPData common.GeoIPData,
 	allowPrivateIPAddressCandidates bool,
 	filterPrivateIPAddressCandidates bool) ([]byte, *webRTCSDPMetrics, error) {
@@ -2776,19 +2787,23 @@ func filterSDPAddresses(
 		errorOnNoCandidates,
 		"",
 		false,
-		allowPrivateIPAddressCandidates,
-		filterPrivateIPAddressCandidates,
 		lookupGeoIP,
-		expectedGeoIPData)
+		allowGeoIPMismatchCandidates,
+		expectedGeoIPData,
+		allowPrivateIPAddressCandidates,
+		filterPrivateIPAddressCandidates)
 	return filteredSDP, metrics, errors.Trace(err)
 }
 
 // webRTCSDPMetrics are network capability metrics values for an SDP.
 type webRTCSDPMetrics struct {
-	iceCandidateTypes     []ICECandidateType
-	hasIPv6               bool
-	hasPrivateIP          bool
-	filteredICECandidates []string
+	iceCandidateCount      int
+	iceCandidateTypes      []ICECandidateType
+	hasIPv4                bool
+	hasIPv6                bool
+	hasPrivateIP           bool
+	filteredICECandidates  []string
+	allowedGeoIPMismatches int
 }
 
 // processSDPAddresses is based on snowflake/common/util.StripLocalAddresses
@@ -2833,10 +2848,17 @@ func processSDPAddresses(
 	errorOnNoCandidates bool,
 	portMappingExternalAddr string,
 	disableIPv6Candidates bool,
-	allowPrivateIPAddressCandidates bool,
-	filterPrivateIPAddressCandidates bool,
 	lookupGeoIP LookupGeoIP,
-	expectedGeoIPData common.GeoIPData) ([]byte, *webRTCSDPMetrics, error) {
+	allowGeoIPMismatchCandidates bool,
+	expectedGeoIPData common.GeoIPData,
+	allowPrivateIPAddressCandidates bool,
+	filterPrivateIPAddressCandidates bool) ([]byte, *webRTCSDPMetrics, error) {
+
+	if portMappingExternalAddr != "" && lookupGeoIP != nil {
+		// portMappingExternalAddr is used by prepareSDPAddresses and bypasses
+		// GeoIP checks. GeoIP checks are used by filterSDPAddresses.
+		return nil, nil, errors.TraceNew("unsupported")
+	}
 
 	var sessionDescription sdp.SessionDescription
 	err := sessionDescription.Unmarshal(encodedSDP)
@@ -2845,9 +2867,11 @@ func processSDPAddresses(
 	}
 
 	candidateTypes := map[ICECandidateType]bool{}
+	hasIPv4 := false
 	hasIPv6 := false
 	hasPrivateIP := false
 	filteredCandidateReasons := make(map[string]int)
+	allowedGeoIPMismatches := 0
 
 	var portMappingICECandidates []sdp.Attribute
 	if portMappingExternalAddr != "" {
@@ -2867,9 +2891,14 @@ func processSDPAddresses(
 		// Only IPv4 port mapping addresses are supported due to the
 		// NewCandidateHost limitation noted below. It is expected that port
 		// mappings will be IPv4, as NAT and IPv6 is not a typical combination.
+		//
+		// Skip the port mapping if the address doesn't appear to be a public,
+		// routable IP address. There is no allowPrivateIPAddressCandidates
+		// exception in this case, since the port mapping is not expected to
+		// be a common LAN address that could be used in personal pairing mode.
 
 		hostIP := net.ParseIP(host)
-		if hostIP != nil && hostIP.To4() != nil {
+		if hostIP != nil && hostIP.To4() != nil && !common.IsBogon(hostIP) {
 
 			for _, component := range []webrtc.ICEComponent{webrtc.ICEComponentRTP, webrtc.ICEComponentRTCP} {
 
@@ -2931,8 +2960,11 @@ func processSDPAddresses(
 					return nil, nil, errors.TraceNew("unexpected non-IP")
 				}
 
+				candidateIsIPv4 := false
 				candidateIsIPv6 := false
-				if candidateIP.To4() == nil {
+				if candidateIP.To4() != nil {
+					candidateIsIPv4 = true
+				} else {
 					if disableIPv6Candidates {
 						reason := fmt.Sprintf("disabled %s IPv6",
 							candidate.Type().String())
@@ -2989,6 +3021,9 @@ func processSDPAddresses(
 				// address, as there could be a mix of IPv4 and IPv6, as well
 				// as potentially different NAT paths.
 				//
+				// For IPv6, only the ASN must match as IPv6 GeoIP country
+				// data appears less reliable in practise.
+				//
 				// In some cases, legitimate clients and proxies may
 				// unintentionally submit candidates with mismatching GeoIP.
 				// This can occur, for example, when a STUN candidate is only
@@ -2998,28 +3033,48 @@ func processSDPAddresses(
 				// SDPs containing unexpected GeoIP candidates, they are
 				// instead stripped out and the resulting filtered SDP is
 				// used.
+				//
+				// In personal pairing mode, mismatching GeoIP candidates are
+				// allowed and peers are trusted to not misdirect each other
+				// to arbitrary destinations. This enables modes such as
+				// InproxyProxySplitUpstreamInterfaceName and broker
+				// tunneling that cannot relay the original client IP.
 
 				if lookupGeoIP != nil {
 					candidateGeoIPData := lookupGeoIP(candidate.Address())
 
-					if candidateGeoIPData.Country != expectedGeoIPData.Country ||
-						candidateGeoIPData.ASN != expectedGeoIPData.ASN {
+					mismatch := false
+					if candidateIsIPv6 {
+						mismatch = candidateGeoIPData.ASN != expectedGeoIPData.ASN
+					} else {
+						mismatch = candidateGeoIPData.Country != expectedGeoIPData.Country ||
+							candidateGeoIPData.ASN != expectedGeoIPData.ASN
+					}
 
-						version := "IPv4"
-						if candidateIsIPv6 {
-							version = "IPv6"
+					if mismatch {
+
+						if allowGeoIPMismatchCandidates {
+							allowedGeoIPMismatches += 1
+						} else {
+							version := "IPv4"
+							if candidateIsIPv6 {
+								version = "IPv6"
+							}
+							reason := fmt.Sprintf(
+								"unexpected GeoIP %s %s: %s/%s",
+								candidate.Type().String(),
+								version,
+								candidateGeoIPData.Country,
+								candidateGeoIPData.ASN)
+							filteredCandidateReasons[reason] += 1
+							continue
 						}
-						reason := fmt.Sprintf(
-							"unexpected GeoIP %s %s: %s/%s",
-							candidate.Type().String(),
-							version,
-							candidateGeoIPData.Country,
-							candidateGeoIPData.ASN)
-						filteredCandidateReasons[reason] += 1
-						continue
 					}
 				}
 
+				if candidateIsIPv4 {
+					hasIPv4 = true
+				}
 				if candidateIsIPv6 {
 					hasIPv6 = true
 				}
@@ -3058,8 +3113,11 @@ func processSDPAddresses(
 	}
 
 	metrics := &webRTCSDPMetrics{
-		hasIPv6:      hasIPv6,
-		hasPrivateIP: hasPrivateIP,
+		iceCandidateCount:      candidateCount,
+		hasIPv4:                hasIPv4,
+		hasIPv6:                hasIPv6,
+		hasPrivateIP:           hasPrivateIP,
+		allowedGeoIPMismatches: allowedGeoIPMismatches,
 	}
 	for candidateType := range candidateTypes {
 		metrics.iceCandidateTypes = append(metrics.iceCandidateTypes, candidateType)
@@ -3246,17 +3304,20 @@ type pionNetwork struct {
 	dialCtx               context.Context
 	logger                pion_logging.LeveledLogger
 	webRTCDialCoordinator WebRTCDialCoordinator
+	excludeInterfaceName  string
 }
 
 func newPionNetwork(
 	dialCtx context.Context,
 	logger pion_logging.LeveledLogger,
-	webRTCDialCoordinator WebRTCDialCoordinator) *pionNetwork {
+	webRTCDialCoordinator WebRTCDialCoordinator,
+	excludeInterfaceName string) *pionNetwork {
 
 	return &pionNetwork{
 		dialCtx:               dialCtx,
 		logger:                logger,
 		webRTCDialCoordinator: webRTCDialCoordinator,
+		excludeInterfaceName:  excludeInterfaceName,
 	}
 }
 
@@ -3318,6 +3379,10 @@ func (p *pionNetwork) Interfaces() ([]*transport.Interface, error) {
 	}
 
 	for _, netInterface := range netInterfaces {
+		if p.excludeInterfaceName != "" && netInterface.Name == p.excludeInterfaceName {
+			continue
+		}
+
 		// Note: don't exclude interfaces with the net.FlagPointToPoint flag,
 		// which is set for certain mobile networks
 		if (netInterface.Flags&net.FlagUp == 0) ||

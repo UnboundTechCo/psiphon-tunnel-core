@@ -1,8 +1,8 @@
 # filippo.io/bigmod v0.0.1
 ## explicit; go 1.20
 filippo.io/bigmod
-# filippo.io/edwards25519 v1.1.0
-## explicit; go 1.20
+# filippo.io/edwards25519 v1.2.0
+## explicit; go 1.24.0
 filippo.io/edwards25519
 filippo.io/edwards25519/field
 # filippo.io/keygen v0.0.0-20230306160926-5201437acf8e
@@ -104,7 +104,7 @@ github.com/cespare/xxhash
 # github.com/cheekybits/genny v0.0.0-20170328200008-9127e812e1e9
 ## explicit
 github.com/cheekybits/genny/generic
-# github.com/cloudflare/circl v1.6.1
+# github.com/cloudflare/circl v1.6.3
 ## explicit; go 1.22.0
 github.com/cloudflare/circl/dh/x25519
 github.com/cloudflare/circl/dh/x448
@@ -249,6 +249,9 @@ github.com/klauspost/compress/internal/le
 github.com/klauspost/compress/internal/snapref
 github.com/klauspost/compress/zstd
 github.com/klauspost/compress/zstd/internal/xxhash
+# github.com/klauspost/cpuid/v2 v2.2.9
+## explicit; go 1.20
+github.com/klauspost/cpuid/v2
 # github.com/libp2p/go-reuseport v0.4.0
 ## explicit; go 1.20
 github.com/libp2p/go-reuseport
@@ -269,6 +272,9 @@ github.com/mdlayher/socket
 # github.com/miekg/dns v1.1.56
 ## explicit; go 1.19
 github.com/miekg/dns
+# github.com/minio/crc64nvme v1.1.1
+## explicit; go 1.22
+github.com/minio/crc64nvme
 # github.com/mitchellh/panicwrap v0.0.0-20170106182340-fce601fe5557
 ## explicit
 github.com/mitchellh/panicwrap
@@ -397,6 +403,9 @@ github.com/pion/webrtc/v3/internal/mux
 github.com/pion/webrtc/v3/internal/util
 github.com/pion/webrtc/v3/pkg/media
 github.com/pion/webrtc/v3/pkg/rtcerr
+# github.com/pires/go-proxyproto v0.11.0
+## explicit; go 1.24
+github.com/pires/go-proxyproto
 # github.com/pkg/errors v0.9.1
 ## explicit
 github.com/pkg/errors
@@ -520,6 +529,18 @@ github.com/x448/float16
 # github.com/yusufpapurcu/wmi v1.2.4
 ## explicit; go 1.16
 github.com/yusufpapurcu/wmi
+# github.com/zeebo/blake3 v0.2.4
+## explicit; go 1.18
+github.com/zeebo/blake3
+github.com/zeebo/blake3/internal/alg
+github.com/zeebo/blake3/internal/alg/compress
+github.com/zeebo/blake3/internal/alg/compress/compress_pure
+github.com/zeebo/blake3/internal/alg/compress/compress_sse41
+github.com/zeebo/blake3/internal/alg/hash
+github.com/zeebo/blake3/internal/alg/hash/hash_avx2
+github.com/zeebo/blake3/internal/alg/hash/hash_pure
+github.com/zeebo/blake3/internal/consts
+github.com/zeebo/blake3/internal/utils
 # gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/goptlib v1.5.0
 ## explicit; go 1.11
 gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/goptlib

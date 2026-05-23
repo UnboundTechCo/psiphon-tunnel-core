@@ -29,7 +29,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	std_errors "errors"
-	"hash/crc64"
 	"io"
 	"io/ioutil"
 	"net"
@@ -54,6 +53,7 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/transforms"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/values"
 	lrucache "github.com/cognusion/go-cache-lru"
+	"github.com/minio/crc64nvme"
 	"golang.org/x/crypto/nacl/box"
 	"golang.org/x/time/rate"
 )
@@ -81,6 +81,10 @@ const (
 	// Protocol version 3 clients include resiliency enhancements and will add a Range header
 	// when retrying a request for a partially downloaded response payload.
 	MEEK_PROTOCOL_VERSION_3 = 3
+
+	// Protocol version 4 add support for meek payload padding, which is
+	// enabled via the meek cookie.
+	MEEK_PROTOCOL_VERSION_4 = 4
 
 	MEEK_MAX_REQUEST_PAYLOAD_LENGTH                  = 65536
 	MEEK_MIN_SESSION_ID_LENGTH                       = 8
@@ -130,7 +134,6 @@ type MeekServer struct {
 	stopBroadcast                   <-chan struct{}
 	sessionsLock                    sync.RWMutex
 	sessions                        map[string]*meekSession
-	checksumTable                   *crc64.Table
 	bufferPool                      *CachedResponseBufferPool
 	rateLimitLock                   sync.Mutex
 	rateLimitHistory                *lrucache.Cache
@@ -207,8 +210,6 @@ func NewMeekServer(
 		}
 	}
 
-	checksumTable := crc64.MakeTable(crc64.ECMA)
-
 	bufferLength := MEEK_DEFAULT_POOL_BUFFER_LENGTH
 	if support.Config.MeekCachedResponsePoolBufferSize != 0 {
 		bufferLength = support.Config.MeekCachedResponsePoolBufferSize
@@ -258,7 +259,6 @@ func NewMeekServer(
 		openConns:                       common.NewConns[net.Conn](),
 		stopBroadcast:                   stopBroadcast,
 		sessions:                        make(map[string]*meekSession),
-		checksumTable:                   checksumTable,
 		bufferPool:                      bufferPool,
 		rateLimitHistory:                rateLimitHistory,
 		rateLimitSignalGC:               make(chan struct{}, 1),
@@ -319,7 +319,7 @@ func NewMeekServer(
 
 		if !inproxy.Enabled() {
 			// Note that, technically, it may be possible to allow this case,
-			// since PSIPHON_ENABLE_INPROXY is currently required only for
+			// since !PSIPHON_DISABLE_INPROXY is currently required only for
 			// client/proxy-side WebRTC functionality, although that could change.
 			return nil, errors.TraceNew("inproxy implementation is not enabled")
 		}
@@ -533,6 +533,11 @@ func (server *MeekServer) ServeHTTP(responseWriter http.ResponseWriter, request 
 	// may be used to identify a CDN edge. When this check fails,
 	// TerminateHTTPConnection is called instead of handleError, so any
 	// persistent connection is always closed.
+	//
+	// In MeekRequiredHeadersNonStrict mode, the request is allowed but
+	// functionality that depends on required headers is disabled.
+
+	missingRequiredHeaders := false
 
 	if len(server.support.Config.MeekRequiredHeaders) > 0 {
 		for header, value := range server.support.Config.MeekRequiredHeaders {
@@ -545,13 +550,16 @@ func (server *MeekServer) ServeHTTP(responseWriter http.ResponseWriter, request 
 			// expected value length isn't a vulnerability as long as the
 			// secret is long enough and random.
 			if subtle.ConstantTimeCompare([]byte(requestValue), []byte(value)) != 1 {
-				log.WithTraceFields(LogFields{
-					"header": header,
-					"value":  requestValue,
-				}).Warning("invalid required meek header")
+				if !server.support.Config.MeekRequiredHeadersNonStrict {
+					log.WithTraceFields(LogFields{
+						"header": header,
+						"value":  requestValue,
+					}).Warning("invalid required meek header")
 
-				common.TerminateHTTPConnection(responseWriter, request)
-				return
+					common.TerminateHTTPConnection(responseWriter, request)
+					return
+				}
+				missingRequiredHeaders = true
 			}
 		}
 	}
@@ -636,7 +644,7 @@ func (server *MeekServer) ServeHTTP(responseWriter http.ResponseWriter, request 
 		endPoint,
 		endPointClientIP,
 		endPointGeoIPData,
-		err := server.getSessionOrEndpoint(request, meekCookie)
+		err := server.getSessionOrEndpoint(request, meekCookie, missingRequiredHeaders)
 
 	if err != nil {
 		// Debug since session cookie errors commonly occur during
@@ -645,6 +653,8 @@ func (server *MeekServer) ServeHTTP(responseWriter http.ResponseWriter, request 
 		server.handleError(responseWriter, request)
 		return
 	}
+
+	// TODO: log missingRequiredHeaders in all cases
 
 	if endPoint != "" {
 
@@ -659,6 +669,7 @@ func (server *MeekServer) ServeHTTP(responseWriter http.ResponseWriter, request 
 				common.GeoIPData(*endPointGeoIPData),
 				responseWriter,
 				request)
+
 			// Currently, TacticsServer.HandleEndPoint handles returning a 404 instead
 			// leaving that up to server.handleError.
 			//
@@ -669,6 +680,7 @@ func (server *MeekServer) ServeHTTP(responseWriter http.ResponseWriter, request 
 			err := server.inproxyBrokerHandler(
 				endPointClientIP,
 				common.GeoIPData(*endPointGeoIPData),
+				missingRequiredHeaders,
 				responseWriter,
 				request)
 			if err != nil {
@@ -735,13 +747,19 @@ func (server *MeekServer) ServeHTTP(responseWriter http.ResponseWriter, request 
 
 	// If a newer request has arrived while waiting, discard this one.
 	// Do not delay processing the newest request.
-	//
+	if session.requestCount.Load() > requestNumber {
+
+		// Do not return 404 in this error case. Keep session open to allow
+		// client to retry.
+		return
+	}
+
 	// If the session expired and was deleted while this request was waiting,
 	// discard this request. The session is no longer valid, and the final call
 	// to session.cachedResponse.Reset may have already occured, so any further
 	// session.cachedResponse access may deplete resources (fail to refill the pool).
-	if session.requestCount.Load() > requestNumber || session.deleted {
-		common.TerminateHTTPConnection(responseWriter, request)
+	if session.deleted {
+		server.handleError(responseWriter, request)
 		return
 	}
 
@@ -754,18 +772,19 @@ func (server *MeekServer) ServeHTTP(responseWriter http.ResponseWriter, request 
 	// clients to resend request payloads, when retrying due to connection
 	// interruption, without knowing whether the server has received or
 	// relayed the data.
+	//
+	// pumpReads also handles discarding meek request payload padding.
 
-	requestSize, err := session.clientConn.pumpReads(request.Body)
+	requestSize, allowCachedResponse, err := session.clientConn.pumpReads(request.Body)
 	if err != nil {
 		if err != io.EOF {
 			// Debug since errors such as "i/o timeout" occur during normal operation;
 			// also, golang network error messages may contain client IP.
 			log.WithTraceFields(LogFields{"error": err}).Debug("read request failed")
 		}
-		common.TerminateHTTPConnection(responseWriter, request)
 
-		// Note: keep session open to allow client to retry
-
+		// Do not return 404 in this error case. Keep session open to allow
+		// client to retry.
 		return
 	}
 
@@ -817,11 +836,21 @@ func (server *MeekServer) ServeHTTP(responseWriter http.ResponseWriter, request 
 	// The client is not expected to send position > 0 when there is
 	// no cached response; let that case fall through to the next
 	// HasPosition check which will fail and close the session.
+	//
+	// Limitation: when a client sends a request that never reaches the
+	// server, it will retry with a Range header and position 0. This case
+	// leads to a flaw in the resiliency design, since the server may have a
+	// stale cached response from a _previous_ request and this can lead to
+	// sending a response body twice, breaking the stream. To partially
+	// mitigate this, the pumpReads allowCachedResponse value is used as a
+	// heuristic to distinguish Range 0 cases that should not use cached
+	// responses.
 
 	var responseSize int
 	var responseError error
 
-	if isRetry && (hasCompleteCachedResponse || position > 0) {
+	if isRetry &&
+		(position > 0 || (hasCompleteCachedResponse && allowCachedResponse)) {
 
 		if !session.cachedResponse.HasPosition(position) {
 			greaterThanSwapInt64(&session.metricCachedResponseMissPosition, int64(position))
@@ -888,10 +917,9 @@ func (server *MeekServer) ServeHTTP(responseWriter http.ResponseWriter, request 
 			// also, golang network error messages may contain client IP.
 			log.WithTraceFields(LogFields{"error": responseError}).Debug("write response failed")
 		}
-		server.handleError(responseWriter, request)
 
-		// Note: keep session open to allow client to retry
-
+		// Do not return 404 in this error case. Keep session open to allow
+		// client to retry.
 		return
 	}
 }
@@ -947,7 +975,8 @@ func checkRangeHeader(request *http.Request) (int, bool) {
 // performs rate limiting and header handling for the in-proxy broker case.
 func (server *MeekServer) getSessionOrEndpoint(
 	request *http.Request,
-	meekCookie *http.Cookie) (string, *meekSession, net.Conn, string, string, *GeoIPData, error) {
+	meekCookie *http.Cookie,
+	missingRequiredHeaders bool) (string, *meekSession, net.Conn, string, string, *GeoIPData, error) {
 
 	underlyingConn := request.Context().Value(meekNetConnContextKey).(net.Conn)
 
@@ -992,7 +1021,14 @@ func (server *MeekServer) getSessionOrEndpoint(
 		return "", nil, nil, "", "", nil, errors.TraceNew("invalid IP address")
 	}
 
-	if server.isFronted && len(server.support.Config.MeekProxyForwardedForHeaders) > 0 {
+	// Both X-Forwarded-For/etc., and steering IP features are disabled if
+	// MeekRequiredHeaders is specified but the headers are missing. Any
+	// original client IP or steering IP header is only trusted if the peer
+	// provides MeekRequiredHeaders.
+
+	if server.isFronted &&
+		!missingRequiredHeaders &&
+		len(server.support.Config.MeekProxyForwardedForHeaders) > 0 {
 
 		// When there are multiple header names in MeekProxyForwardedForHeaders,
 		// the first valid match is preferred. MeekProxyForwardedForHeaders should be
@@ -1040,7 +1076,10 @@ func (server *MeekServer) getSessionOrEndpoint(
 	// in order to be recorded here and relayed to the client.
 
 	var steeringIP string
-	if server.isFronted && server.support.Config.EnableSteeringIPs {
+	if server.isFronted &&
+		!missingRequiredHeaders &&
+		server.support.Config.EnableSteeringIPs {
+
 		steeringIP = request.Header.Get("X-Psiphon-Steering-Ip")
 		if steeringIP != "" {
 			IP := net.ParseIP(steeringIP)
@@ -1159,13 +1198,12 @@ func (server *MeekServer) getSessionOrEndpoint(
 	// See the comment in server.LoadConfig regarding fronting provider ID
 	// limitations.
 
-	if protocol.TunnelProtocolUsesFrontedMeek(server.listenerTunnelProtocol) &&
-		server.support.ServerTacticsParametersCache != nil {
+	p, err := server.support.ServerTacticsParametersCache.Get(geoIPData)
+	if err != nil {
+		return "", nil, nil, "", "", nil, errors.Trace(err)
+	}
 
-		p, err := server.support.ServerTacticsParametersCache.Get(geoIPData)
-		if err != nil {
-			return "", nil, nil, "", "", nil, errors.Trace(err)
-		}
+	if protocol.TunnelProtocolUsesFrontedMeek(server.listenerTunnelProtocol) {
 
 		if !p.IsNil() &&
 			common.Contains(
@@ -1222,6 +1260,44 @@ func (server *MeekServer) getSessionOrEndpoint(
 	}
 
 	session.touch()
+
+	if clientSessionData.EnablePayloadPadding {
+
+		// Initialize meek payload padding when the client signals
+		// use of payload padding via the meek cookie.
+
+		if p.IsNil() {
+			return "", nil, nil, "", "", nil,
+				errors.TraceNew("unsupported payload padding")
+		}
+
+		limitTunnelProtocols := p.TunnelProtocols(
+			parameters.MeekPayloadPaddingLimitTunnelProtocols)
+		if len(limitTunnelProtocols) > 0 &&
+			!common.Contains(limitTunnelProtocols,
+				clientSessionData.ClientTunnelProtocol) {
+
+			return "", nil, nil, "", "", nil,
+				errors.TraceNew("unexpected payload padding")
+		}
+
+		session.requestPaddingState, err = protocol.NewMeekRequestPayloadPaddingState(
+			server.support.Config.MeekObfuscatedKey,
+			meekCookie.Value,
+			0.0, 0, 0)
+		if err != nil {
+			return "", nil, nil, "", "", nil, errors.Trace(err)
+		}
+		session.responsePaddingState, err = protocol.NewMeekResponsePayloadPaddingState(
+			server.support.Config.MeekObfuscatedKey,
+			meekCookie.Value,
+			p.Float(parameters.MeekPayloadPaddingServerOmitProbability),
+			p.Int(parameters.MeekPayloadPaddingServerMinSize),
+			p.Int(parameters.MeekPayloadPaddingServerMaxSize))
+		if err != nil {
+			return "", nil, nil, "", "", nil, errors.Trace(err)
+		}
+	}
 
 	// Create a new meek conn that will relay the payload
 	// between meek request/responses and the tunnel server client
@@ -1870,7 +1946,19 @@ func (server *MeekServer) inproxyReloadTactics() error {
 		return errors.Trace(err)
 	}
 
-	err = server.inproxyBroker.SetCommonCompartmentIDs(commonCompartmentIDs)
+	sponsorCommonCompartmentIDStrs :=
+		p.InproxyKeyCompartmentID(parameters.InproxySponsorCommonCompartmentID)
+	sponsorCommonCompartmentID := make(map[string]inproxy.ID)
+	for key, strID := range sponsorCommonCompartmentIDStrs {
+		ID, err := inproxy.IDFromString(strID)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		sponsorCommonCompartmentID[key] = ID
+	}
+
+	err = server.inproxyBroker.SetCommonCompartmentIDs(
+		commonCompartmentIDs, sponsorCommonCompartmentID)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -1882,8 +1970,8 @@ func (server *MeekServer) inproxyReloadTactics() error {
 		p.Duration(parameters.InproxyBrokerPendingServerRequestsTTL),
 		p.KeyDurations(parameters.InproxyFrontingProviderServerMaxRequestTimeouts))
 
-	nonlimitedProxyIDs, err := inproxy.IDsFromStrings(
-		p.Strings(parameters.InproxyBrokerMatcherAnnouncementNonlimitedProxyIDs))
+	exemptProxyIDs, err := inproxy.IDsFromStrings(
+		p.Strings(parameters.InproxyBrokerMatcherAnnouncementExemptProxyIDs))
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -1891,10 +1979,12 @@ func (server *MeekServer) inproxyReloadTactics() error {
 		p.Int(parameters.InproxyBrokerMatcherAnnouncementLimitEntryCount),
 		p.Int(parameters.InproxyBrokerMatcherAnnouncementRateLimitQuantity),
 		p.Duration(parameters.InproxyBrokerMatcherAnnouncementRateLimitInterval),
-		nonlimitedProxyIDs,
+		exemptProxyIDs,
+		p.Strings(parameters.InproxyBrokerMatcherAnnouncementExemptSponsorIDs),
 		p.Int(parameters.InproxyBrokerMatcherOfferLimitEntryCount),
 		p.Int(parameters.InproxyBrokerMatcherOfferRateLimitQuantity),
 		p.Duration(parameters.InproxyBrokerMatcherOfferRateLimitInterval),
+		p.Duration(parameters.InproxyBrokerMatcherOfferMinimumDeadline),
 		p.Int(parameters.InproxyMaxCompartmentIDListLength),
 		p.Int(parameters.InproxyBrokerDSLRequestRateLimitQuantity),
 		p.Duration(parameters.InproxyBrokerDSLRequestRateLimitInterval))
@@ -1922,22 +2012,17 @@ func (server *MeekServer) inproxyReloadTactics() error {
 				return true
 			}
 		}
-		lookup := make(map[string]map[string]struct{})
+		lookup := make(map[string]common.StringLookup)
 		for key, items := range lists {
-			// TODO: use linear search for lists below stringLookupThreshold?
-			itemLookup := make(map[string]struct{})
-			for _, item := range items {
-				itemLookup[item] = struct{}{}
-			}
-			lookup[key] = itemLookup
+			lookup[key] = common.NewStringLookup(items)
 		}
 		return func(key, item string) bool {
-			itemLookup := lookup[key]
-			if itemLookup == nil {
+			itemLookup, ok := lookup[key]
+			if !ok {
 				// Allow when no list
 				return true
 			}
-			_, found := itemLookup[item]
+			found := itemLookup.Contains(item)
 			// Allow or disallow based on list type
 			return found == isAllowList
 		}
@@ -2118,6 +2203,7 @@ func (server *MeekServer) inproxyBrokerRelayDSLRequest(
 func (server *MeekServer) inproxyBrokerHandler(
 	clientIP string,
 	geoIPData common.GeoIPData,
+	missingRequiredHeaders bool,
 	w http.ResponseWriter,
 	r *http.Request) (retErr error) {
 
@@ -2158,6 +2244,10 @@ func (server *MeekServer) inproxyBrokerHandler(
 
 	transportLogFields := common.LogFields{
 		"meek_server_http_version": r.Proto,
+	}
+
+	if missingRequiredHeaders {
+		transportLogFields["meek_missing_required_headers"] = missingRequiredHeaders
 	}
 
 	packet, err = server.inproxyBroker.HandleSessionPacket(
@@ -2212,6 +2302,8 @@ type meekSession struct {
 	cookieName                       string
 	contentType                      string
 	httpVersion                      string
+	requestPaddingState              *protocol.MeekPayloadPaddingState
+	responsePaddingState             *protocol.MeekPayloadPaddingState
 }
 
 func (session *meekSession) touch() {
@@ -2283,6 +2375,8 @@ func (session *meekSession) GetMetrics() common.LogFields {
 	logFields["meek_cookie_name"] = session.cookieName
 	logFields["meek_content_type"] = session.contentType
 	logFields["meek_server_http_version"] = session.httpVersion
+	logFields["meek_payload_padding"] =
+		session.requestPaddingState != nil || session.responsePaddingState != nil
 	return logFields
 }
 
@@ -2459,9 +2553,18 @@ func (conn *meekConn) StopFragmenting() {
 // without a Read() immediately consuming the bytes, but there's still
 // a possibility of a stall if no Read() calls are made after this
 // read buffer is full.
-// Returns the number of request bytes read.
+//
+// Returns the number of request bytes read, excluding any payload padding
+// bytes, and whether an existing cached response _may_ be safely used for
+// this request.
+//
+// It's safe to use cached response if the request body is a duplicate,
+// ambiguous when the request body is empty with no padding, and not safe
+// when the request body is not a duplicate. pumpReads returns true in the
+// first two cases.
+//
 // Note: assumes only one concurrent call to pumpReads
-func (conn *meekConn) pumpReads(reader io.Reader) (int64, error) {
+func (conn *meekConn) pumpReads(reader io.Reader) (int64, bool, error) {
 
 	// Use either an empty or partial buffer. By using a partial
 	// buffer, pumpReads will not block if the Read() caller has
@@ -2472,7 +2575,7 @@ func (conn *meekConn) pumpReads(reader io.Reader) (int64, error) {
 	case readBuffer = <-conn.emptyReadBuffer:
 	case readBuffer = <-conn.partialReadBuffer:
 	case <-conn.closeBroadcast:
-		return 0, io.EOF
+		return 0, false, io.EOF
 	}
 
 	newDataOffset := readBuffer.Len()
@@ -2483,9 +2586,12 @@ func (conn *meekConn) pumpReads(reader io.Reader) (int64, error) {
 
 	// +1 allows for an explicit check for request payloads that
 	// exceed the maximum permitted length.
-	limitReader := io.LimitReader(reader, MEEK_MAX_REQUEST_PAYLOAD_LENGTH+1)
-	n, err := readBuffer.ReadFrom(limitReader)
+	reader = io.LimitReader(reader, MEEK_MAX_REQUEST_PAYLOAD_LENGTH+1)
 
+	checksumWriter := crc64nvme.New()
+	reader = io.TeeReader(reader, checksumWriter)
+
+	n, err := readBuffer.ReadFrom(reader)
 	if err == nil && n == MEEK_MAX_REQUEST_PAYLOAD_LENGTH+1 {
 		err = std_errors.New("invalid request payload length")
 	}
@@ -2493,10 +2599,23 @@ func (conn *meekConn) pumpReads(reader io.Reader) (int64, error) {
 	// If the request read fails, don't relay the new data. This allows
 	// the client to retry and resend its request payload without
 	// interrupting/duplicating the payload flow.
+	//
+	// Also return early here, and don't update the retry checksum, when an
+	// empty payload is read. In some retry cases, the client will skip
+	// resending the payload when it knows the server received it. In payload
+	// padding mode, this handles the case when padding is omitted for an
+	// empty payload.
+
 	if err != nil {
 		readBuffer.Truncate(newDataOffset)
 		conn.replaceReadBuffer(readBuffer)
-		return 0, errors.Trace(err)
+		return 0, false, errors.Trace(err)
+	}
+
+	if n == 0 {
+		readBuffer.Truncate(newDataOffset)
+		conn.replaceReadBuffer(readBuffer)
+		return 0, true, nil
 	}
 
 	// Check if request payload checksum matches immediately
@@ -2506,21 +2625,85 @@ func (conn *meekConn) pumpReads(reader io.Reader) (int64, error) {
 	// will not repeat. In the highly unlikely case that it does,
 	// the underlying SSH connection will fail and the client
 	// must reconnect.
+	//
+	// In payload padding mode, any padding -- prefix, header, padding
+	// itself -- is treated as part of the payload checksum; client retries
+	// will resend the same padding.
 
-	checksum := crc64.Checksum(
-		readBuffer.Bytes()[newDataOffset:], conn.meekServer.checksumTable)
+	checksum := checksumWriter.Sum64()
 
 	if conn.lastReadChecksum == nil {
 		conn.lastReadChecksum = new(uint64)
 	} else if *conn.lastReadChecksum == checksum {
 		readBuffer.Truncate(newDataOffset)
+		conn.replaceReadBuffer(readBuffer)
+		return 0, true, nil
 	}
 
 	*conn.lastReadChecksum = checksum
 
+	paddingBytesRead := int64(0)
+
+	if conn.meekSession.requestPaddingState != nil {
+
+		// In payload padding mode, any non empty request body is expected to
+		// have a padding prefix and possibly a full padding header with
+		// padding itself.
+		//
+		// At this point, the request body has been fully read without error,
+		// and any client retry repeats of the same request body have been
+		// skipped. The ReceiverConsumePadding call will unconditionally
+		// advance the padding cipher stream state, and no short reads
+		// (ErrMeekPaddingStateImmediateEOF) are expected.
+
+		var paddingReader io.Reader
+		if newDataOffset == 0 {
+
+			// Fast path: ReceiverConsumePadding consumes from the start of
+			// readBuffer.
+
+			paddingReader = readBuffer
+		} else {
+
+			// Slower path: the new payload has been appended to a non-empty
+			// readBuffer, so ReceiverConsumePadding will consume from the
+			// middle of the readBuffer and the post-padding bytes will be
+			// shifted forward. This approach doesn't require any additional
+			// buffer allocations.
+
+			paddingReader = bytes.NewReader(readBuffer.Bytes()[newDataOffset:])
+		}
+
+		paddingBytesRead, _, err = conn.meekSession.requestPaddingState.
+			ReceiverConsumePadding(paddingReader)
+		if paddingBytesRead > n {
+			err = errors.TraceNew("unexpected padding bytes read")
+		}
+		if err != nil {
+			readBuffer.Truncate(newDataOffset)
+			conn.replaceReadBuffer(readBuffer)
+			return 0, false, errors.Trace(err)
+		}
+
+		// Return only the actual payload size read, which is important for
+		// caller's skipExtendedTurnAround heuristic.
+		n -= paddingBytesRead
+
+		if newDataOffset > 0 {
+			// TODO: shift in the other direction, pre-newDataOffset forward,
+			// if that's fewer bytes?
+			buf := readBuffer.Bytes()
+			bufLen := readBuffer.Len()
+			paddingSize := bufLen - newDataOffset - paddingReader.(*bytes.Reader).Len()
+			copy(buf[newDataOffset:],
+				buf[newDataOffset+paddingSize:])
+			readBuffer.Truncate(bufLen - paddingSize)
+		}
+	}
+
 	conn.replaceReadBuffer(readBuffer)
 
-	return n, nil
+	return n, false, nil
 }
 
 var errMeekConnectionHasClosed = std_errors.New("meek connection has closed")
@@ -2576,13 +2759,35 @@ func (conn *meekConn) pumpWrites(
 	for {
 		select {
 		case buffer := <-conn.nextWriteBuffer:
+
+			if conn.meekSession.responsePaddingState != nil && n == 0 {
+
+				// When in payload padding mode, every payload has an initial padding
+				// prefix. In this case, receiving nextWriteBuffer implies
+				// there are payload bytes, so the prefix indicates no padding.
+
+				paddingHeader, err := conn.meekSession.responsePaddingState.
+					SenderGetNextPadding(false)
+				if err == nil {
+					var written int
+					written, err = writer.Write(paddingHeader)
+					n += written
+				}
+				if err != nil {
+					err = errors.Trace(err)
+					// See "always send" comment below.
+					conn.writeResult <- err
+					return n, err
+				}
+			}
+
 			written, err := writer.Write(buffer)
 			n += written
 			// Assumes that writeResult won't block.
 			// Note: always send the err to writeResult,
 			// as the Write() caller is blocking on this.
+			err = errors.Trace(err)
 			conn.writeResult <- err
-
 			if err != nil {
 				return n, err
 			}
@@ -2606,6 +2811,26 @@ func (conn *meekConn) pumpWrites(
 			timeout.Reset(conn.meekServer.turnAroundTimeout)
 
 		case <-timeout.C:
+
+			if conn.meekSession.responsePaddingState != nil && n == 0 {
+
+				// When in payload padding mode, and there's no payload, add padding.
+
+				paddingHeader, err := conn.meekSession.responsePaddingState.
+					SenderGetNextPadding(true)
+				if err != nil {
+					return n, errors.Trace(err)
+				}
+
+				if len(paddingHeader) > 0 {
+					written, err := writer.Write(paddingHeader)
+					n += written
+					if err != nil {
+						return n, errors.Trace(err)
+					}
+				}
+			}
+
 			return n, nil
 
 		case <-conn.closeBroadcast:

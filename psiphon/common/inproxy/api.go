@@ -255,18 +255,21 @@ func (p NetworkProtocol) IsStream() bool {
 // ProxyMetrics are network topolology and resource metrics provided by a
 // proxy to a broker. The broker uses this information when matching proxies
 // and clients.
+// Limitation: Currently, there is no MaxReducedPersonalClients config, as
+// We assumed that users would not want the personal connections to be reduced.
 type ProxyMetrics struct {
 	BaseAPIParameters             protocol.PackedAPIParameters `cbor:"1,keyasint,omitempty"`
 	ProtocolVersion               int32                        `cbor:"2,keyasint,omitempty"`
 	NATType                       NATType                      `cbor:"3,keyasint,omitempty"`
 	PortMappingTypes              PortMappingTypes             `cbor:"4,keyasint,omitempty"`
-	MaxClients                    int32                        `cbor:"6,keyasint,omitempty"`
+	MaxCommonClients              int32                        `cbor:"6,keyasint,omitempty"`
 	ConnectingClients             int32                        `cbor:"7,keyasint,omitempty"`
 	ConnectedClients              int32                        `cbor:"8,keyasint,omitempty"`
 	LimitUpstreamBytesPerSecond   int64                        `cbor:"9,keyasint,omitempty"`
 	LimitDownstreamBytesPerSecond int64                        `cbor:"10,keyasint,omitempty"`
 	PeakUpstreamBytesPerSecond    int64                        `cbor:"11,keyasint,omitempty"`
 	PeakDownstreamBytesPerSecond  int64                        `cbor:"12,keyasint,omitempty"`
+	MaxPersonalClients            int32                        `cbor:"13,keyasint,omitempty"`
 }
 
 // ClientMetrics are network topolology metrics provided by a client to a
@@ -296,16 +299,22 @@ type ClientMetrics struct {
 // overhead, proxies with multiple workers should designate just one worker
 // to set CheckTactics.
 //
+// When PreCheckTactics is set, the broker checks tactics as with
+// CheckTactics, but responds immediately without awaiting a match. This
+// option enables the proxy to quickly establish the shared Noise protocol
+// session and launch all workers.
+//
 // The proxy's session public key is an implicit and cryptographically
 // verified proxy ID.
 type ProxyAnnounceRequest struct {
 	PersonalCompartmentIDs []ID          `cbor:"1,keyasint,omitempty"`
 	Metrics                *ProxyMetrics `cbor:"2,keyasint,omitempty"`
 	CheckTactics           bool          `cbor:"3,keyasint,omitempty"`
+	PreCheckTactics        bool          `cbor:"4,keyasint,omitempty"`
 }
 
 // WebRTCSessionDescription is compatible with pion/webrtc.SessionDescription
-// and facilitates the PSIPHON_ENABLE_INPROXY build tag exclusion of pion
+// and facilitates the PSIPHON_DISABLE_INPROXY build tag exclusion of pion
 // dependencies.
 type WebRTCSessionDescription struct {
 	Type int    `cbor:"1,keyasint,omitempty"`
@@ -339,16 +348,17 @@ type ProxyAnnounceResponse struct {
 	TacticsPayload              []byte                    `cbor:"2,keyasint,omitempty"`
 	Limited                     bool                      `cbor:"3,keyasint,omitempty"`
 	NoMatch                     bool                      `cbor:"4,keyasint,omitempty"`
-	MustUpgrade                 bool                      `cbor:"13,keyasint,omitempty"`
 	ConnectionID                ID                        `cbor:"5,keyasint,omitempty"`
 	SelectedProtocolVersion     int32                     `cbor:"6,keyasint,omitempty"`
 	ClientOfferSDP              WebRTCSessionDescription  `cbor:"7,keyasint,omitempty"`
 	ClientRootObfuscationSecret ObfuscationSecret         `cbor:"8,keyasint,omitempty"`
 	DoDTLSRandomization         bool                      `cbor:"9,keyasint,omitempty"`
-	UseMediaStreams             bool                      `cbor:"14,keyasint,omitempty"`
 	TrafficShapingParameters    *TrafficShapingParameters `cbor:"10,keyasint,omitempty"`
 	NetworkProtocol             NetworkProtocol           `cbor:"11,keyasint,omitempty"`
 	DestinationAddress          string                    `cbor:"12,keyasint,omitempty"`
+	MustUpgrade                 bool                      `cbor:"13,keyasint,omitempty"`
+	UseMediaStreams             bool                      `cbor:"14,keyasint,omitempty"`
+	ClientRegion                string                    `cbor:"15,keyasint,omitempty"`
 }
 
 // ClientOfferRequest is an API request sent from a client to a broker,
@@ -379,11 +389,11 @@ type ClientOfferRequest struct {
 	ICECandidateTypes            ICECandidateTypes         `cbor:"5,keyasint,omitempty"`
 	ClientRootObfuscationSecret  ObfuscationSecret         `cbor:"6,keyasint,omitempty"`
 	DoDTLSRandomization          bool                      `cbor:"7,keyasint,omitempty"`
-	UseMediaStreams              bool                      `cbor:"12,keyasint,omitempty"`
 	TrafficShapingParameters     *TrafficShapingParameters `cbor:"8,keyasint,omitempty"`
 	PackedDestinationServerEntry []byte                    `cbor:"9,keyasint,omitempty"`
 	NetworkProtocol              NetworkProtocol           `cbor:"10,keyasint,omitempty"`
 	DestinationAddress           string                    `cbor:"11,keyasint,omitempty"`
+	UseMediaStreams              bool                      `cbor:"12,keyasint,omitempty"`
 }
 
 // TrafficShapingParameters specifies data channel or media stream traffic
@@ -451,8 +461,11 @@ type ProxyAnswerRequest struct {
 	// SelectedProtocolVersion int32 `cbor:"2,keyasint,omitempty"`
 }
 
-// ProxyAnswerResponse is the acknowledgement for a ProxyAnswerRequest.
+// ProxyAnswerResponse is the acknowledgement for a ProxyAnswerRequest. If
+// NoAwaitingClient is indicated, then the client was no longer awaiting the
+// answer and the proxy should abandon the connection attempt.
 type ProxyAnswerResponse struct {
+	NoAwaitingClient bool `cbor:"1,keyasint,omitempty"`
 }
 
 // ClientRelayedPacketRequest is an API request sent from a client to a
@@ -662,7 +675,9 @@ func (metrics *ProxyMetrics) ValidateAndGetParametersAndLogFields(
 	logFields[logFieldPrefix+"protocol_version"] = metrics.ProtocolVersion
 	logFields[logFieldPrefix+"nat_type"] = metrics.NATType
 	logFields[logFieldPrefix+"port_mapping_types"] = metrics.PortMappingTypes
-	logFields[logFieldPrefix+"max_clients"] = metrics.MaxClients
+	logFields[logFieldPrefix+"max_common_clients"] = metrics.MaxCommonClients
+	logFields[logFieldPrefix+"max_personal_clients"] = metrics.MaxPersonalClients
+	logFields[logFieldPrefix+"max_clients"] = metrics.MaxCommonClients + metrics.MaxPersonalClients
 	logFields[logFieldPrefix+"connecting_clients"] = metrics.ConnectingClients
 	logFields[logFieldPrefix+"connected_clients"] = metrics.ConnectedClients
 	logFields[logFieldPrefix+"limit_upstream_bytes_per_second"] = metrics.LimitUpstreamBytesPerSecond
@@ -790,14 +805,22 @@ func (request *ClientOfferRequest) ValidateAndGetLogFields(
 	// The client offer SDP may contain no ICE candidates.
 	errorOnNoCandidates := false
 
+	isPersonal := len(request.PersonalCompartmentIDs) > 0 &&
+		len(request.CommonCompartmentIDs) == 0
+
 	// The client offer SDP may include RFC 1918/4193 private IP addresses in
 	// personal pairing mode. filterSDPAddresses should not filter out
 	// private IP addresses based on the broker's local interfaces; this
 	// filtering occurs on the proxy that receives the SDP.
-	allowPrivateIPAddressCandidates :=
-		len(request.PersonalCompartmentIDs) > 0 &&
-			len(request.CommonCompartmentIDs) == 0
+	allowPrivateIPAddressCandidates := isPersonal
 	filterPrivateIPAddressCandidates := false
+
+	// In personal pairing mode, allow GeoIP mismatch between ICE candidates
+	// and the broker-observed peer address, geoIPData. The personal paired
+	// client is trusted to not misdirect the proxy to an arbitrary
+	// destination. This exception allows for broker tunneling that cannot
+	// relay the original client IP.
+	allowGeoIPMismatchCandidates := isPersonal
 
 	// Client offer SDP candidate addresses must match the country and ASN of
 	// the client. Don't facilitate connections to arbitrary destinations.
@@ -805,6 +828,7 @@ func (request *ClientOfferRequest) ValidateAndGetLogFields(
 		[]byte(request.ClientOfferSDP.SDP),
 		errorOnNoCandidates,
 		lookupGeoIP,
+		allowGeoIPMismatchCandidates,
 		geoIPData,
 		allowPrivateIPAddressCandidates,
 		filterPrivateIPAddressCandidates)
@@ -849,10 +873,13 @@ func (request *ClientOfferRequest) ValidateAndGetLogFields(
 
 	logFields["has_common_compartment_ids"] = hasCommonCompartmentIDs
 	logFields["has_personal_compartment_ids"] = hasPersonalCompartmentIDs
+	logFields["ice_candidate_count"] = sdpMetrics.iceCandidateCount
 	logFields["ice_candidate_types"] = request.ICECandidateTypes
+	logFields["has_IPv4"] = sdpMetrics.hasIPv4
 	logFields["has_IPv6"] = sdpMetrics.hasIPv6
 	logFields["has_private_IP"] = sdpMetrics.hasPrivateIP
 	logFields["filtered_ice_candidates"] = sdpMetrics.filteredICECandidates
+	logFields["allowed_geoip_mismatches"] = sdpMetrics.allowedGeoIPMismatches
 	logFields["use_media_streams"] = request.UseMediaStreams
 
 	return filteredSDP, logFields, nil
@@ -890,7 +917,8 @@ func (params *TrafficShapingParameters) Validate() error {
 }
 
 // ValidateAndGetLogFields validates the ProxyAnswerRequest and returns
-// common.LogFields for logging.
+// common.LogFields for logging. A nil filteredSDP is returned when
+// ProxyAnswerRequest.AnswerError is set.
 func (request *ProxyAnswerRequest) ValidateAndGetLogFields(
 	lookupGeoIP LookupGeoIP,
 	baseAPIParameterValidator common.APIParameterValidator,
@@ -898,27 +926,42 @@ func (request *ProxyAnswerRequest) ValidateAndGetLogFields(
 	geoIPData common.GeoIPData,
 	proxyAnnouncementHasPersonalCompartmentIDs bool) ([]byte, common.LogFields, error) {
 
-	// The proxy answer SDP must contain at least one ICE candidate.
-	errorOnNoCandidates := true
+	var filteredSDP []byte
+	var sdpMetrics *webRTCSDPMetrics
+	var err error
 
-	// The proxy answer SDP may include RFC 1918/4193 private IP addresses in
-	// personal pairing mode. filterSDPAddresses should not filter out
-	// private IP addresses based on the broker's local interfaces; this
-	// filtering occurs on the client that receives the SDP.
-	allowPrivateIPAddressCandidates := proxyAnnouncementHasPersonalCompartmentIDs
-	filterPrivateIPAddressCandidates := false
+	if request.AnswerError == "" {
 
-	// Proxy answer SDP candidate addresses must match the country and ASN of
-	// the proxy. Don't facilitate connections to arbitrary destinations.
-	filteredSDP, sdpMetrics, err := filterSDPAddresses(
-		[]byte(request.ProxyAnswerSDP.SDP),
-		errorOnNoCandidates,
-		lookupGeoIP,
-		geoIPData,
-		allowPrivateIPAddressCandidates,
-		filterPrivateIPAddressCandidates)
-	if err != nil {
-		return nil, nil, errors.Trace(err)
+		// The proxy answer SDP must contain at least one ICE candidate.
+		errorOnNoCandidates := true
+
+		// The proxy answer SDP may include RFC 1918/4193 private IP addresses in
+		// personal pairing mode. filterSDPAddresses should not filter out
+		// private IP addresses based on the broker's local interfaces; this
+		// filtering occurs on the client that receives the SDP.
+		allowPrivateIPAddressCandidates := proxyAnnouncementHasPersonalCompartmentIDs
+		filterPrivateIPAddressCandidates := false
+
+		// In personal pairing mode, allow GeoIP mismatch between ICE
+		// candidates and the broker-observed peer address, geoIPData. The
+		// personal paired proxy is trusted to not misdirect the client to an
+		// arbitrary destination. This exception allows for modes such as
+		// InproxyProxySplitUpstreamInterfaceName.
+		allowGeoIPMismatchCandidates := proxyAnnouncementHasPersonalCompartmentIDs
+
+		// Proxy answer SDP candidate addresses must match the country and ASN of
+		// the proxy. Don't facilitate connections to arbitrary destinations.
+		filteredSDP, sdpMetrics, err = filterSDPAddresses(
+			[]byte(request.ProxyAnswerSDP.SDP),
+			errorOnNoCandidates,
+			lookupGeoIP,
+			allowGeoIPMismatchCandidates,
+			geoIPData,
+			allowPrivateIPAddressCandidates,
+			filterPrivateIPAddressCandidates)
+		if err != nil {
+			return nil, nil, errors.Trace(err)
+		}
 	}
 
 	// The proxy's self-reported ICECandidateTypes are used instead of the
@@ -935,10 +978,15 @@ func (request *ProxyAnswerRequest) ValidateAndGetLogFields(
 
 	logFields["connection_id"] = request.ConnectionID
 	logFields["ice_candidate_types"] = request.ICECandidateTypes
-	logFields["has_IPv6"] = sdpMetrics.hasIPv6
-	logFields["has_private_IP"] = sdpMetrics.hasPrivateIP
-	logFields["filtered_ice_candidates"] = sdpMetrics.filteredICECandidates
 	logFields["answer_error"] = request.AnswerError
+	if sdpMetrics != nil {
+		logFields["ice_candidate_count"] = sdpMetrics.iceCandidateCount
+		logFields["has_IPv4"] = sdpMetrics.hasIPv4
+		logFields["has_IPv6"] = sdpMetrics.hasIPv6
+		logFields["has_private_IP"] = sdpMetrics.hasPrivateIP
+		logFields["filtered_ice_candidates"] = sdpMetrics.filteredICECandidates
+		logFields["allowed_geoip_mismatches"] = sdpMetrics.allowedGeoIPMismatches
+	}
 
 	return filteredSDP, logFields, nil
 }
@@ -1062,9 +1110,9 @@ func MarshalProxyAnnounceRequest(request *ProxyAnnounceRequest) ([]byte, error) 
 }
 
 func UnmarshalProxyAnnounceRequest(payload []byte) (*ProxyAnnounceRequest, error) {
-	var request *ProxyAnnounceRequest
+	var request ProxyAnnounceRequest
 	err := unmarshalRecord(recordTypeAPIProxyAnnounceRequest, payload, &request)
-	return request, errors.Trace(err)
+	return &request, errors.Trace(err)
 }
 
 func MarshalProxyAnnounceResponse(response *ProxyAnnounceResponse) ([]byte, error) {
@@ -1073,9 +1121,9 @@ func MarshalProxyAnnounceResponse(response *ProxyAnnounceResponse) ([]byte, erro
 }
 
 func UnmarshalProxyAnnounceResponse(payload []byte) (*ProxyAnnounceResponse, error) {
-	var response *ProxyAnnounceResponse
+	var response ProxyAnnounceResponse
 	err := unmarshalRecord(recordTypeAPIProxyAnnounceResponse, payload, &response)
-	return response, errors.Trace(err)
+	return &response, errors.Trace(err)
 }
 
 func MarshalProxyAnswerRequest(request *ProxyAnswerRequest) ([]byte, error) {
@@ -1084,9 +1132,9 @@ func MarshalProxyAnswerRequest(request *ProxyAnswerRequest) ([]byte, error) {
 }
 
 func UnmarshalProxyAnswerRequest(payload []byte) (*ProxyAnswerRequest, error) {
-	var request *ProxyAnswerRequest
+	var request ProxyAnswerRequest
 	err := unmarshalRecord(recordTypeAPIProxyAnswerRequest, payload, &request)
-	return request, errors.Trace(err)
+	return &request, errors.Trace(err)
 }
 
 func MarshalProxyAnswerResponse(response *ProxyAnswerResponse) ([]byte, error) {
@@ -1095,9 +1143,9 @@ func MarshalProxyAnswerResponse(response *ProxyAnswerResponse) ([]byte, error) {
 }
 
 func UnmarshalProxyAnswerResponse(payload []byte) (*ProxyAnswerResponse, error) {
-	var response *ProxyAnswerResponse
+	var response ProxyAnswerResponse
 	err := unmarshalRecord(recordTypeAPIProxyAnswerResponse, payload, &response)
-	return response, errors.Trace(err)
+	return &response, errors.Trace(err)
 }
 
 func MarshalClientOfferRequest(request *ClientOfferRequest) ([]byte, error) {
@@ -1106,9 +1154,9 @@ func MarshalClientOfferRequest(request *ClientOfferRequest) ([]byte, error) {
 }
 
 func UnmarshalClientOfferRequest(payload []byte) (*ClientOfferRequest, error) {
-	var request *ClientOfferRequest
+	var request ClientOfferRequest
 	err := unmarshalRecord(recordTypeAPIClientOfferRequest, payload, &request)
-	return request, errors.Trace(err)
+	return &request, errors.Trace(err)
 }
 
 func MarshalClientOfferResponse(response *ClientOfferResponse) ([]byte, error) {
@@ -1117,9 +1165,9 @@ func MarshalClientOfferResponse(response *ClientOfferResponse) ([]byte, error) {
 }
 
 func UnmarshalClientOfferResponse(payload []byte) (*ClientOfferResponse, error) {
-	var response *ClientOfferResponse
+	var response ClientOfferResponse
 	err := unmarshalRecord(recordTypeAPIClientOfferResponse, payload, &response)
-	return response, errors.Trace(err)
+	return &response, errors.Trace(err)
 }
 
 func MarshalClientRelayedPacketRequest(request *ClientRelayedPacketRequest) ([]byte, error) {
@@ -1128,9 +1176,9 @@ func MarshalClientRelayedPacketRequest(request *ClientRelayedPacketRequest) ([]b
 }
 
 func UnmarshalClientRelayedPacketRequest(payload []byte) (*ClientRelayedPacketRequest, error) {
-	var request *ClientRelayedPacketRequest
+	var request ClientRelayedPacketRequest
 	err := unmarshalRecord(recordTypeAPIClientRelayedPacketRequest, payload, &request)
-	return request, errors.Trace(err)
+	return &request, errors.Trace(err)
 }
 
 func MarshalClientRelayedPacketResponse(response *ClientRelayedPacketResponse) ([]byte, error) {
@@ -1139,9 +1187,9 @@ func MarshalClientRelayedPacketResponse(response *ClientRelayedPacketResponse) (
 }
 
 func UnmarshalClientRelayedPacketResponse(payload []byte) (*ClientRelayedPacketResponse, error) {
-	var response *ClientRelayedPacketResponse
+	var response ClientRelayedPacketResponse
 	err := unmarshalRecord(recordTypeAPIClientRelayedPacketResponse, payload, &response)
-	return response, errors.Trace(err)
+	return &response, errors.Trace(err)
 }
 
 func MarshalBrokerServerReport(request *BrokerServerReport) ([]byte, error) {
@@ -1150,9 +1198,9 @@ func MarshalBrokerServerReport(request *BrokerServerReport) ([]byte, error) {
 }
 
 func UnmarshalBrokerServerReport(payload []byte) (*BrokerServerReport, error) {
-	var request *BrokerServerReport
+	var request BrokerServerReport
 	err := unmarshalRecord(recordTypeAPIBrokerServerReport, payload, &request)
-	return request, errors.Trace(err)
+	return &request, errors.Trace(err)
 }
 
 func MarshalServerProxyQualityRequest(request *ServerProxyQualityRequest) ([]byte, error) {
@@ -1161,9 +1209,9 @@ func MarshalServerProxyQualityRequest(request *ServerProxyQualityRequest) ([]byt
 }
 
 func UnmarshalServerProxyQualityRequest(payload []byte) (*ServerProxyQualityRequest, error) {
-	var request *ServerProxyQualityRequest
+	var request ServerProxyQualityRequest
 	err := unmarshalRecord(recordTypeAPIServerProxyQualityRequest, payload, &request)
-	return request, errors.Trace(err)
+	return &request, errors.Trace(err)
 }
 
 func MarshalServerProxyQualityResponse(response *ServerProxyQualityResponse) ([]byte, error) {
@@ -1172,9 +1220,9 @@ func MarshalServerProxyQualityResponse(response *ServerProxyQualityResponse) ([]
 }
 
 func UnmarshalServerProxyQualityResponse(payload []byte) (*ServerProxyQualityResponse, error) {
-	var response *ServerProxyQualityResponse
+	var response ServerProxyQualityResponse
 	err := unmarshalRecord(recordTypeAPIServerProxyQualityResponse, payload, &response)
-	return response, errors.Trace(err)
+	return &response, errors.Trace(err)
 }
 
 func MarshalClientDSLRequest(request *ClientDSLRequest) ([]byte, error) {
@@ -1183,9 +1231,9 @@ func MarshalClientDSLRequest(request *ClientDSLRequest) ([]byte, error) {
 }
 
 func UnmarshalClientDSLRequest(payload []byte) (*ClientDSLRequest, error) {
-	var request *ClientDSLRequest
+	var request ClientDSLRequest
 	err := unmarshalRecord(recordTypeAPIClientDSLRequest, payload, &request)
-	return request, errors.Trace(err)
+	return &request, errors.Trace(err)
 }
 
 func MarshalClientDSLResponse(response *ClientDSLResponse) ([]byte, error) {
@@ -1194,7 +1242,7 @@ func MarshalClientDSLResponse(response *ClientDSLResponse) ([]byte, error) {
 }
 
 func UnmarshalClientDSLResponse(payload []byte) (*ClientDSLResponse, error) {
-	var response *ClientDSLResponse
+	var response ClientDSLResponse
 	err := unmarshalRecord(recordTypeAPIClientDSLResponse, payload, &response)
-	return response, errors.Trace(err)
+	return &response, errors.Trace(err)
 }

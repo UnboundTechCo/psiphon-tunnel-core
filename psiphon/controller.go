@@ -42,6 +42,7 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/parameters"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/push"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/resolver"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/tactics"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/tun"
@@ -587,6 +588,18 @@ func (controller *Controller) TerminateNextActiveTunnel() {
 	}
 }
 
+// AppResumed notifies active tunnels that the host app has resumed from
+// background.
+func (controller *Controller) AppResumed() {
+
+	controller.tunnelMutex.Lock()
+	defer controller.tunnelMutex.Unlock()
+
+	for _, tunnel := range controller.tunnels {
+		tunnel.AppResumed()
+	}
+}
+
 // ExportExchangePayload creates a payload for client-to-client server
 // connection info exchange. See the comment for psiphon.ExportExchangePayload
 // for more details.
@@ -598,7 +611,7 @@ func (controller *Controller) ExportExchangePayload() string {
 // See the comment for psiphon.ImportExchangePayload for more details about
 // the import.
 //
-// When the import is successful, a signal is set to trigger a restart any
+// When the import is successful, a signal is set to trigger a restart of any
 // establishment in progress. This will cause the newly imported server entry
 // to be prioritized, which it otherwise would not be in later establishment
 // rounds. The establishment process continues after ImportExchangePayload
@@ -624,6 +637,62 @@ func (controller *Controller) ImportExchangePayload(payload string) bool {
 	}
 
 	return true
+}
+
+// ImportPushPayload imports a server entry push payload.
+//
+// When the import is successful, a signal is set to trigger a restart of any
+// establishment in progress. This will cause imported server entries to be
+// prioritized as indicated in the payload. The establishment process
+// continues after ImportPushPayload returns.
+//
+// If the client already has a connected tunnel, or a tunnel connection is
+// established concurrently with the import, the signal has no effect as the
+// overall goal is establish _any_ connection.
+func (controller *Controller) ImportPushPayload(payload []byte) bool {
+
+	importer := func(
+		packedServerEntryFields protocol.PackedServerEntryFields,
+		source string,
+		prioritizeDial bool,
+		prioritizeReason string,
+		prioritizeTunnelProtocol string) error {
+
+		err := DSLStoreServerEntry(
+			controller.config.ServerEntrySignaturePublicKey,
+			packedServerEntryFields,
+			protocol.PushServerEntrySource(source),
+			prioritizeDial,
+			prioritizeReason,
+			prioritizeTunnelProtocol,
+			controller.config.GetNetworkID())
+		if err != nil {
+			return errors.Trace(err)
+		}
+
+		return nil
+	}
+
+	n, err := push.ImportPushPayload(
+		controller.config.PushPayloadObfuscationKey,
+		controller.config.PushPayloadSignaturePublicKey,
+		payload,
+		importer)
+
+	if err != nil {
+		NoticeWarning("push payload: %d imported, %v", n, err)
+	} else {
+		NoticeInfo("push payload: %d imported", n)
+	}
+
+	if n > 0 {
+		select {
+		case controller.signalRestartEstablishing <- struct{}{}:
+		default:
+		}
+	}
+
+	return err == nil
 }
 
 // remoteServerListFetcher fetches an out-of-band list of server entries
@@ -1784,6 +1853,7 @@ func (p *protocolSelectionConstraints) selectProtocol(
 	connectTunnelCount int,
 	excludeIntensive bool,
 	preferInproxy bool,
+	prioritizeTunnelProtocol string,
 	serverEntry *protocol.ServerEntry) (string, time.Duration, bool) {
 
 	candidateProtocols := p.supportedProtocols(
@@ -1791,6 +1861,7 @@ func (p *protocolSelectionConstraints) selectProtocol(
 
 	// Prefer selecting an in-proxy tunnel protocol when indicated, but fall
 	// back to other protocols when no in-proxy protocol is supported.
+	// Takes precedence over any DSL prioritize tunnel protocol hint.
 
 	if preferInproxy && candidateProtocols.HasInproxyTunnelProtocols() {
 		NoticeInfo("in-proxy protocol preferred")
@@ -1801,13 +1872,24 @@ func (p *protocolSelectionConstraints) selectProtocol(
 		return "", 0, false
 	}
 
+	// Apply the DSL prioritize tunnel protocol hint if the protocol is in the
+	// candidateProtocols list that meets the current constraints. Otherwise,
+	// fall back to the randomized selection path.
+
+	selectedProtocol := ""
+	if prioritizeTunnelProtocol != "" &&
+		common.Contains(candidateProtocols, prioritizeTunnelProtocol) {
+		selectedProtocol = prioritizeTunnelProtocol
+	}
+
 	// Pick at random from the supported protocols. This ensures that we'll
 	// eventually try all possible protocols. Depending on network
 	// configuration, it may be the case that some protocol is only available
 	// through multi-capability servers, and a simpler ranked preference of
 	// protocols could lead to that protocol never being selected.
-
-	selectedProtocol := candidateProtocols[prng.Intn(len(candidateProtocols))]
+	if selectedProtocol == "" {
+		selectedProtocol = candidateProtocols[prng.Intn(len(candidateProtocols))]
+	}
 
 	if !protocol.TunnelProtocolUsesInproxy(selectedProtocol) ||
 		p.inproxyClientDialRateLimiter == nil {
@@ -2180,43 +2262,13 @@ func (controller *Controller) launchEstablishing() {
 	controller.establishInproxyForceSelectionCount =
 		p.Int(parameters.InproxyTunnelProtocolForceSelectionCount)
 
-	// ConnectionWorkerPoolSize may be set by tactics.
-	//
-	// In-proxy personal pairing mode uses a distinct parameter which is
-	// typically configured to a lower number, limiting concurrent load and
-	// announcement consumption for personal proxies.
+	// workerPoolSize is the number of concurrent establishTunnelWorkers, each
+	// dialing tunnels.
 
-	var workerPoolSize int
-	if controller.config.IsInproxyClientPersonalPairingMode() {
-		workerPoolSize = p.Int(parameters.InproxyPersonalPairingConnectionWorkerPoolSize)
-	} else {
-		workerPoolSize = p.Int(parameters.ConnectionWorkerPoolSize)
-	}
-
-	// In aggressive establishment mode, increase the worker pool size to
-	// handle the larger number of candidates (one per protocol per server).
-	// Use at least 30 workers, unless already set higher.
-	if controller.config.AggressiveEstablishment && workerPoolSize < 30 {
-		workerPoolSize = 30
-	}
+	workerPoolSize := controller.getConnectionWorkerPoolSize(p)
 
 	if controller.config.AggressiveEstablishment {
 		NoticeInfo("beast mode active (workers: %d)", workerPoolSize)
-	}
-
-	// When TargetServerEntry is used, override any worker pool size config or
-	// tactic parameter and use a pool size of 1. The typical use case for
-	// TargetServerEntry is to test a specific server with a single connection
-	// attempt. Furthermore, too many concurrent attempts to connect to the
-	// same server will trigger rate limiting.
-	if controller.config.TargetServerEntry != "" {
-		workerPoolSize = 1
-	}
-
-	// When DisableConnectionWorkerPool is set, no tunnel establishment
-	// workers are run. See Config.DisableConnectionWorkerPool.
-	if controller.config.DisableConnectionWorkerPool {
-		workerPoolSize = 0
 	}
 
 	// TunnelPoolSize may be set by tactics, subject to local constraints. A pool
@@ -2238,6 +2290,8 @@ func (controller *Controller) launchEstablishing() {
 		tunnelPoolSize = 1
 	}
 	controller.setTunnelPoolSize(tunnelPoolSize)
+
+	disableServerEntriesReporter := p.Bool(parameters.DisableServerEntriesReporter)
 
 	p.Close()
 
@@ -2275,12 +2329,14 @@ func (controller *Controller) launchEstablishing() {
 	// lists) with the original; the contents of these slices don't change
 	// past this point. The rate limiter should not be used by
 	// serverEntriesReporter, but is cleared just in case.
-	copyConstraints := *controller.protocolSelectionConstraints
-	copyConstraints.inproxyClientDialRateLimiter = nil
-	controller.signalServerEntriesReporter(
-		&serverEntriesReportRequest{
-			constraints: &copyConstraints,
-		})
+	if !disableServerEntriesReporter {
+		copyConstraints := *controller.protocolSelectionConstraints
+		copyConstraints.inproxyClientDialRateLimiter = nil
+		controller.signalServerEntriesReporter(
+			&serverEntriesReportRequest{
+				constraints: &copyConstraints,
+			})
+	}
 
 	if controller.protocolSelectionConstraints.hasInitialProtocols() ||
 		tunnelPoolSize > 1 {
@@ -2291,7 +2347,7 @@ func (controller *Controller) launchEstablishing() {
 		// requirements can't be met, the constraint and/or pool size are
 		// adjusted in order to avoid spinning unable to select any protocol
 		// or trying to establish more tunnels than is possible.
-		controller.doConstraintsScan()
+		controller.doConstraintsScan(controller.establishCtx)
 	}
 
 	controller.resetServerEntryIterationMetrics()
@@ -2305,7 +2361,62 @@ func (controller *Controller) launchEstablishing() {
 	go controller.establishCandidateGenerator()
 }
 
-func (controller *Controller) doConstraintsScan() {
+func (controller *Controller) getConnectionWorkerPoolSize(
+	p parameters.ParametersAccessor) int {
+
+	// ConnectionWorkerPoolSize may be set by tactics.
+	//
+	// In-proxy personal pairing mode uses a distinct parameter which is
+	// typically configured to a lower number, limiting concurrent load and
+	// announcement consumption for personal proxies.
+	//
+	// ConnectionWorkerPoolMaxSize is a config-only cap on the worker pool
+	// size which may be set in low memory environments.
+
+	var workerPoolSize int
+	if controller.config.IsInproxyClientPersonalPairingMode() {
+		workerPoolSize = p.Int(parameters.InproxyPersonalPairingConnectionWorkerPoolSize)
+	} else {
+		workerPoolSize = p.Int(parameters.ConnectionWorkerPoolSize)
+	}
+
+	if controller.config.ConnectionWorkerPoolMaxSize > 0 &&
+		workerPoolSize > controller.config.ConnectionWorkerPoolMaxSize {
+
+		workerPoolSize = controller.config.ConnectionWorkerPoolMaxSize
+	}
+
+	// In aggressive establishment mode, increase the worker pool size to
+	// handle the larger number of candidates (one per protocol per server).
+	// Use at least 30 workers, unless already capped lower.
+	if controller.config.AggressiveEstablishment && workerPoolSize < 30 {
+		workerPoolSize = 30
+		if controller.config.ConnectionWorkerPoolMaxSize > 0 &&
+			workerPoolSize > controller.config.ConnectionWorkerPoolMaxSize {
+
+			workerPoolSize = controller.config.ConnectionWorkerPoolMaxSize
+		}
+	}
+
+	// When TargetServerEntry is used, override any worker pool size config or
+	// tactic parameter and use a pool size of 1. The typical use case for
+	// TargetServerEntry is to test a specific server with a single connection
+	// attempt. Furthermore, too many concurrent attempts to connect to the
+	// same server will trigger rate limiting.
+	if controller.config.TargetServerEntry != "" {
+		workerPoolSize = 1
+	}
+
+	// When DisableConnectionWorkerPool is set, no tunnel establishment
+	// workers are run. See Config.DisableConnectionWorkerPool.
+	if controller.config.DisableConnectionWorkerPool {
+		workerPoolSize = 0
+	}
+
+	return workerPoolSize
+}
+
+func (controller *Controller) doConstraintsScan(ctx context.Context) {
 
 	// Scan over server entries in order to check and adjust any initial
 	// tunnel protocol limit and tunnel pool size.
@@ -2351,8 +2462,13 @@ func (controller *Controller) doConstraintsScan() {
 		}
 
 		select {
+		case <-ctx.Done():
+			// Don't block establishment restart: cancel the scan.
+			scanCancelled = true
+			return false
 		case <-controller.runCtx.Done():
 			// Don't block controller shutdown: cancel the scan.
+			scanCancelled = true
 			return false
 		default:
 			return true
@@ -2511,8 +2627,12 @@ func (controller *Controller) establishCandidateGenerator() {
 	// from reported tunnel establishment duration.
 	var totalNetworkWaitDuration time.Duration
 
-	applyServerAffinity, iterator, err := NewServerEntryIterator(controller.config)
+	applyServerAffinity, iterator, err := NewServerEntryIterator(
+		controller.establishCtx, controller.config)
 	if err != nil {
+		if controller.isStopEstablishing() {
+			return
+		}
 		NoticeError("failed to iterate over candidates: %v", errors.Trace(err))
 		controller.SignalComponentFailure()
 		return
@@ -2579,8 +2699,11 @@ loop:
 			roundNetworkWaitDuration += networkWaitDuration
 			totalNetworkWaitDuration += networkWaitDuration
 
-			serverEntry, err := iterator.Next()
+			serverEntry, err := iterator.Next(controller.establishCtx)
 			if err != nil {
+				if controller.isStopEstablishing() {
+					break loop
+				}
 				NoticeError("failed to get next candidate: %v", errors.Trace(err))
 				controller.SignalComponentFailure()
 				return
@@ -2802,8 +2925,11 @@ loop:
 		timer.Stop()
 
 		if resetIterator {
-			err := iterator.Reset()
+			err := iterator.Reset(controller.establishCtx)
 			if err != nil {
+				if controller.isStopEstablishing() {
+					break loop
+				}
 				NoticeError("failed to reset iterator: %v", errors.Trace(err))
 				controller.SignalComponentFailure()
 				return
@@ -2869,7 +2995,7 @@ loop:
 			// broken, the error should persist and eventually get posted.
 
 			p := controller.config.GetParameters().Get()
-			workerPoolSize := p.Int(parameters.ConnectionWorkerPoolSize)
+			workerPoolSize := controller.getConnectionWorkerPoolSize(p)
 			minWaitDuration := p.Duration(parameters.UpstreamProxyErrorMinWaitDuration)
 			maxWaitDuration := p.Duration(parameters.UpstreamProxyErrorMaxWaitDuration)
 			p.Close()
@@ -2996,7 +3122,8 @@ loop:
 		var dialRateLimitDelay time.Duration
 
 		selectProtocol := func(
-			serverEntry *protocol.ServerEntry) (string, bool) {
+			serverEntry *protocol.ServerEntry,
+			prioritizeTunnelProtocol string) (string, bool) {
 
 			// In aggressive establishment mode, the candidate already has a
 			// pre-selected protocol; use it directly.
@@ -3010,6 +3137,7 @@ loop:
 				controller.establishConnectTunnelCount,
 				excludeIntensive,
 				preferInproxy,
+				prioritizeTunnelProtocol,
 				serverEntry)
 
 			dialRateLimitDelay = rateLimitDelay
@@ -3335,18 +3463,21 @@ func (controller *Controller) runInproxyProxy() {
 	// and formatting when debug logging is off.
 	debugLogging := controller.config.InproxyEnableWebRTCDebugLogging
 
-	var lastActivityNotice time.Time
-	var lastAnnouncing int32
-	var lastActivityConnectingClients, lastActivityConnectedClients int32
-	var lastActivityConnectingClientsTotal, lastActivityConnectedClientsTotal int32
-	var activityTotalBytesUp, activityTotalBytesDown int64
+	var lastActivityNotice atomic.Value
+	lastActivityNotice.Store(time.Time{})
+	var lastAnnouncing atomic.Int32
+	var lastActivityConnectingClients, lastActivityConnectedClients atomic.Int32
+	var lastActivityConnectingClientsTotal, lastActivityConnectedClientsTotal atomic.Int32
+	var activityTotalBytesUp, activityTotalBytesDown atomic.Int64
 	activityUpdater := func(
 		announcing int32,
 		connectingClients int32,
 		connectedClients int32,
 		bytesUp int64,
 		bytesDown int64,
-		_ time.Duration) {
+		_ time.Duration,
+		personalRegionActivity map[string]inproxy.RegionActivitySnapshot,
+		commonRegionActivity map[string]inproxy.RegionActivitySnapshot) {
 
 		// This emit logic mirrors the logic for NoticeBytesTransferred and
 		// NoticeTotalBytesTransferred in tunnel.operateTunnel.
@@ -3359,20 +3490,26 @@ func (controller *Controller) runInproxyProxy() {
 
 		if controller.config.EmitInproxyProxyActivity &&
 			(bytesUp > 0 || bytesDown > 0 ||
-				announcing != lastAnnouncing ||
-				connectingClients != lastActivityConnectingClients ||
-				connectedClients != lastActivityConnectedClients) {
+				announcing != lastAnnouncing.Load() ||
+				connectingClients != lastActivityConnectingClients.Load() ||
+				connectedClients != lastActivityConnectedClients.Load()) {
 
 			NoticeInproxyProxyActivity(
-				announcing, connectingClients, connectedClients, bytesUp, bytesDown)
+				announcing,
+				connectingClients,
+				connectedClients,
+				bytesUp,
+				bytesDown,
+				personalRegionActivity,
+				commonRegionActivity)
 
-			lastAnnouncing = announcing
-			lastActivityConnectingClients = connectingClients
-			lastActivityConnectedClients = connectedClients
+			lastAnnouncing.Store(announcing)
+			lastActivityConnectingClients.Store(connectingClients)
+			lastActivityConnectedClients.Store(connectedClients)
 		}
 
-		activityTotalBytesUp += bytesUp
-		activityTotalBytesDown += bytesDown
+		activityTotalBytesUp.Add(bytesUp)
+		activityTotalBytesDown.Add(bytesDown)
 
 		// InproxyProxyTotalActivity periodically emits total bytes
 		// transferred since starting; in addition to the current number of
@@ -3383,17 +3520,19 @@ func (controller *Controller) runInproxyProxy() {
 		// InproxyProxyTotalActivity; the current announcing count is
 		// recorded as a snapshot.
 
-		if lastActivityNotice.Add(activityNoticePeriod).Before(time.Now()) ||
-			connectingClients != lastActivityConnectingClientsTotal ||
-			connectedClients != lastActivityConnectedClientsTotal {
+		lastNotice := lastActivityNotice.Load().(time.Time)
+		now := time.Now()
+		if lastNotice.Add(activityNoticePeriod).Before(now) ||
+			connectingClients != lastActivityConnectingClientsTotal.Load() ||
+			connectedClients != lastActivityConnectedClientsTotal.Load() {
 
 			NoticeInproxyProxyTotalActivity(
 				announcing, connectingClients, connectedClients,
-				activityTotalBytesUp, activityTotalBytesDown)
-			lastActivityNotice = time.Now()
+				activityTotalBytesUp.Load(), activityTotalBytesDown.Load())
+			lastActivityNotice.Store(now)
 
-			lastActivityConnectingClientsTotal = connectingClients
-			lastActivityConnectedClientsTotal = connectedClients
+			lastActivityConnectingClientsTotal.Store(connectingClients)
+			lastActivityConnectedClientsTotal.Store(connectedClients)
 		}
 	}
 
@@ -3405,13 +3544,15 @@ func (controller *Controller) runInproxyProxy() {
 		GetBrokerClient:                      controller.inproxyGetProxyBrokerClient,
 		GetBaseAPIParameters:                 controller.inproxyGetProxyAPIParameters,
 		MakeWebRTCDialCoordinator:            controller.inproxyMakeProxyWebRTCDialCoordinator,
+		ExcludeInterfaceName:                 controller.config.InproxyProxySplitUpstreamInterfaceName,
 		HandleTacticsPayload:                 controller.inproxyHandleProxyTacticsPayload,
-		MaxClients:                           controller.config.InproxyMaxClients,
+		MaxCommonClients:                     controller.config.InproxyMaxCommonClients,
+		MaxPersonalClients:                   controller.config.InproxyMaxPersonalClients,
 		LimitUpstreamBytesPerSecond:          controller.config.InproxyLimitUpstreamBytesPerSecond,
 		LimitDownstreamBytesPerSecond:        controller.config.InproxyLimitDownstreamBytesPerSecond,
 		ReducedStartTime:                     controller.config.InproxyReducedStartTime,
 		ReducedEndTime:                       controller.config.InproxyReducedEndTime,
-		ReducedMaxClients:                    controller.config.InproxyReducedMaxClients,
+		ReducedMaxCommonClients:              controller.config.InproxyReducedMaxCommonClients,
 		ReducedLimitUpstreamBytesPerSecond:   controller.config.InproxyReducedLimitUpstreamBytesPerSecond,
 		ReducedLimitDownstreamBytesPerSecond: controller.config.InproxyReducedLimitDownstreamBytesPerSecond,
 		MustUpgrade:                          controller.config.OnInproxyMustUpgrade,
@@ -3431,8 +3572,11 @@ func (controller *Controller) runInproxyProxy() {
 
 	// Emit one last NoticeInproxyProxyTotalActivity with the final byte counts.
 	NoticeInproxyProxyTotalActivity(
-		lastAnnouncing, lastActivityConnectingClients, lastActivityConnectedClients,
-		activityTotalBytesUp, activityTotalBytesDown)
+		lastAnnouncing.Load(),
+		lastActivityConnectingClients.Load(),
+		lastActivityConnectedClients.Load(),
+		activityTotalBytesUp.Load(),
+		activityTotalBytesDown.Load())
 
 	NoticeInfo("inproxy proxy: stopped")
 }

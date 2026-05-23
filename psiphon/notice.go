@@ -35,6 +35,7 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/buildinfo"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/inproxy"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/parameters"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/stacktrace"
@@ -563,9 +564,11 @@ func noticeWithDialParameters(noticeType string, dialParams *DialParameters, pos
 			args = append(args, "meekHostHeader", dialParams.MeekHostHeader)
 		}
 
-		// MeekTransformedHostName is meaningful when meek is used, which is when MeekDialAddress != ""
+		// These fields are meaningful when meek is used, which is when
+		// MeekDialAddress != ""
 		if dialParams.MeekDialAddress != "" {
 			args = append(args, "meekTransformedHostName", dialParams.MeekTransformedHostName)
+			args = append(args, "meekPayloadPadding", dialParams.MeekEnablePayloadPadding)
 		}
 
 		if dialParams.TLSOSSHSNIServerName != "" {
@@ -721,6 +724,13 @@ func noticeWithDialParameters(noticeType string, dialParams *DialParameters, pos
 			if dialParams.ShadowsocksPrefixSpec.Spec != nil {
 				args = append(args, "ShadowsocksPrefix", dialParams.ShadowsocksPrefixSpec.Name)
 			}
+		}
+
+		if dialParams.DSLPrioritizedDial && len(dialParams.DSLPrioritizedDialReason) > 0 {
+			args = append(args, "DSLPrioritizedReason", dialParams.DSLPrioritizedDialReason)
+		}
+		if dialParams.DSLPrioritizedDial && len(dialParams.DSLPrioritizedTunnelProtocol) > 0 {
+			args = append(args, "DSLPrioritizedTunnelProtocol", dialParams.DSLPrioritizedTunnelProtocol)
 		}
 
 	}
@@ -1215,7 +1225,9 @@ func NoticeInproxyProxyActivity(
 	connectingClients int32,
 	connectedClients int32,
 	bytesUp int64,
-	bytesDown int64) {
+	bytesDown int64,
+	personalRegionActivity map[string]inproxy.RegionActivitySnapshot,
+	commonRegionActivity map[string]inproxy.RegionActivitySnapshot) {
 
 	singletonNoticeLogger.outputNotice(
 		"InproxyProxyActivity", noticeIsNotDiagnostic,
@@ -1223,7 +1235,9 @@ func NoticeInproxyProxyActivity(
 		"connectingClients", connectingClients,
 		"connectedClients", connectedClients,
 		"bytesUp", bytesUp,
-		"bytesDown", bytesDown)
+		"bytesDown", bytesDown,
+		"personalRegionActivity", personalRegionActivity,
+		"commonRegionActivity", commonRegionActivity)
 }
 
 // NoticeInproxyProxyTotalActivity reports how many proxied bytes have been
@@ -1520,7 +1534,7 @@ func (log *commonLogTrace) Info(args ...interface{}) {
 }
 
 func (log *commonLogTrace) Warning(args ...interface{}) {
-	log.outputNotice("Alert", args...)
+	log.outputNotice("Warning", args...)
 }
 
 func (log *commonLogTrace) Error(args ...interface{}) {

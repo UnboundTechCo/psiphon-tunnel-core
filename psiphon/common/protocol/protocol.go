@@ -63,6 +63,7 @@ const (
 	SERVER_ENTRY_SOURCE_OBFUSCATED = "OBFUSCATED"
 	SERVER_ENTRY_SOURCE_EXCHANGED  = "EXCHANGED"
 	SERVER_ENTRY_SOURCE_DSL        = "DSL-*"
+	SERVER_ENTRY_SOURCE_PUSH       = "PUSH-*"
 
 	CAPABILITY_SSH_API_REQUESTS            = "ssh-api-requests"
 	CAPABILITY_UNTUNNELED_WEB_API_REQUESTS = "handshake"
@@ -117,6 +118,11 @@ var SupportedServerEntrySources = []string{
 	SERVER_ENTRY_SOURCE_OBFUSCATED,
 	SERVER_ENTRY_SOURCE_EXCHANGED,
 	SERVER_ENTRY_SOURCE_DSL,
+	SERVER_ENTRY_SOURCE_PUSH,
+}
+
+func PushServerEntrySource(source string) string {
+	return "PUSH-" + source
 }
 
 func AllowServerEntrySourceWithUpstreamProxy(source string) bool {
@@ -463,6 +469,18 @@ func TunnelProtocolSupportsUpstreamProxy(protocol string) bool {
 }
 
 func TunnelProtocolSupportsTactics(protocol string) bool {
+
+	if TunnelProtocolUsesMeekHTTPNormalizer(protocol) {
+
+		// Limitation: the HTTP normalizer code path has special logic to
+		// extract the meek cookie from the normalized data stream. See
+		// common/transforms.HTTPNormalizer.Read. This logic only supports
+		// one meek cookie per TCP flow, while the untunneled tactics
+		// requests may require up to two meek cookies, one for a speed test
+		// request and one for the tactics request.
+		return false
+	}
+
 	return TunnelProtocolUsesMeek(protocol) &&
 		!TunnelProtocolUsesFrontedMeekCDN(protocol)
 }
@@ -862,6 +880,7 @@ type SSHPasswordPayload struct {
 
 type MeekCookieData struct {
 	MeekProtocolVersion  int    `json:"v,omitempty"`
+	EnablePayloadPadding bool   `json:"p,omitempty"`
 	ClientTunnelProtocol string `json:"t,omitempty"`
 	EndPoint             string `json:"e,omitempty"`
 }

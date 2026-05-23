@@ -1,4 +1,4 @@
-//go:build !PSIPHON_ENABLE_INPROXY
+//go:build PSIPHON_DISABLE_INPROXY
 
 /*
  * Copyright (c) 2024, Psiphon Inc.
@@ -34,7 +34,7 @@ import (
 // The inproxy package has a broad API that referenced throughout the psiphon
 // and psiphon/server packages.
 //
-// When PSIPHON_ENABLE_INPROXY is not specified, inproxy components are
+// When PSIPHON_DISABLE_INPROXY is specified, inproxy components are
 // disabled and large dependencies, including pion and tailscale, are not
 // referenced and excluded from builds. The stub types and functions here are
 // sufficient to omit all pion and tailscale references. The remaining, broad
@@ -61,6 +61,7 @@ type webRTCConn struct {
 type webRTCConfig struct {
 	Logger                      common.Logger
 	EnableDebugLogging          bool
+	ExcludeInterfaceName        string
 	WebRTCDialCoordinator       WebRTCDialCoordinator
 	ClientRootObfuscationSecret ObfuscationSecret
 	DoDTLSRandomization         bool
@@ -129,10 +130,13 @@ func GetQUICMaxPacketSizeAdjustment() int {
 }
 
 type webRTCSDPMetrics struct {
-	iceCandidateTypes     []ICECandidateType
-	hasIPv6               bool
-	hasPrivateIP          bool
-	filteredICECandidates []string
+	iceCandidateCount      int
+	iceCandidateTypes      []ICECandidateType
+	hasIPv4                bool
+	hasIPv6                bool
+	hasPrivateIP           bool
+	filteredICECandidates  []string
+	allowedGeoIPMismatches int
 }
 
 func newWebRTCConnForOffer(
@@ -157,6 +161,7 @@ func filterSDPAddresses(
 	encodedSDP []byte,
 	errorOnNoCandidates bool,
 	lookupGeoIP LookupGeoIP,
+	allowGeoIPMismatchCandidates bool,
 	expectedGeoIPData common.GeoIPData,
 	allowPrivateIPAddressCandidates bool,
 	filterPrivateIPAddressCandidates bool) ([]byte, *webRTCSDPMetrics, error) {

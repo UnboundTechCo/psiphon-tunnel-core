@@ -21,9 +21,9 @@ replace gitlab.com/yawning/obfs4.git => github.com/jmwample/obfs4 v0.0.0-2023072
 // respectively, containing Psiphon customizations. See comments in
 // psiphon/common/inproxy/newWebRTCConn for details.
 //
-// The following replaces are required only when the build tags
-// PSIPHON_ENABLE_REFRACTION_NETWORKING (dtls/v2 only) or
-// PSIPHON_ENABLE_INPROXY are specified.
+// The following replaces are required only when the build tag
+// PSIPHON_ENABLE_REFRACTION_NETWORKING is specified (dtls/v2 only) or
+// PSIPHON_DISABLE_INPROXY is not specified.
 
 replace github.com/pion/dtls/v2 => ./replace/dtls
 
@@ -32,7 +32,7 @@ replace github.com/pion/ice/v2 => ./replace/ice
 replace github.com/pion/webrtc/v3 => ./replace/webrtc
 
 require (
-	filippo.io/edwards25519 v1.1.0
+	filippo.io/edwards25519 v1.2.0
 	github.com/Jigsaw-Code/outline-sdk v0.0.16
 	github.com/Jigsaw-Code/outline-ss-server v1.8.0
 	github.com/Psiphon-Inc/rotate-safe-writer v0.0.0-20210303140923-464a7a37606e
@@ -44,6 +44,7 @@ require (
 	github.com/Psiphon-Labs/quic-go v0.0.0-20250527153145-79fe45fb83b1
 	github.com/Psiphon-Labs/utls v0.0.0-20260129182755-24497d415a8d
 	github.com/armon/go-proxyproto v0.0.0-20180202201750-5b7edb60ff5f
+	github.com/axiomhq/hyperloglog v0.2.6
 	github.com/bifurcation/mint v0.0.0-20180306135233-198357931e61
 	github.com/bits-and-blooms/bloom/v3 v3.6.0
 	github.com/cespare/xxhash v1.1.0
@@ -63,6 +64,7 @@ require (
 	github.com/grafov/m3u8 v0.0.0-20171211212457-6ab8f28ed427
 	github.com/marusama/semaphore v0.0.0-20171214154724-565ffd8e868a
 	github.com/miekg/dns v1.1.56
+	github.com/minio/crc64nvme v1.1.1
 	github.com/mitchellh/panicwrap v0.0.0-20170106182340-fce601fe5557
 	github.com/oschwald/maxminddb-golang v1.12.0
 	github.com/patrickmn/go-cache v2.1.0+incompatible
@@ -77,6 +79,7 @@ require (
 	github.com/pion/stun v0.6.1
 	github.com/pion/transport/v2 v2.2.4
 	github.com/pion/webrtc/v3 v3.2.40
+	github.com/pires/go-proxyproto v0.11.0
 	github.com/refraction-networking/conjure v0.7.11-0.20240130155008-c8df96195ab2
 	github.com/refraction-networking/gotapdance v1.7.10
 	github.com/ryanuber/go-glob v0.0.0-20170128012129-256dc444b735
@@ -87,6 +90,7 @@ require (
 	github.com/tailscale/netlink v1.1.1-0.20211101221916-cabfb018fe85
 	github.com/wader/filtertransport v0.0.0-20200316221534-bdd9e61eee78
 	github.com/wlynxg/anet v0.0.5
+	github.com/zeebo/blake3 v0.2.4
 	golang.org/x/crypto v0.39.0
 	golang.org/x/net v0.41.0
 	golang.org/x/sync v0.15.0
@@ -105,10 +109,9 @@ require (
 	github.com/AndreasBriese/bbloom v0.0.0-20190825152654-46b345b51c96 // indirect
 	github.com/alexbrainman/sspi v0.0.0-20231016080023-1a75b4708caa // indirect
 	github.com/andybalholm/brotli v1.1.1 // indirect
-	github.com/axiomhq/hyperloglog v0.2.6 // indirect
 	github.com/bits-and-blooms/bitset v1.10.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/cloudflare/circl v1.6.1 // indirect
+	github.com/cloudflare/circl v1.6.3 // indirect
 	github.com/coreos/go-iptables v0.7.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/dblohm7/wingoes v0.0.0-20230929194252-e994401fc077 // indirect
@@ -128,6 +131,7 @@ require (
 	github.com/kamstrup/intmap v0.5.2 // indirect
 	github.com/kardianos/osext v0.0.0-20190222173326-2bc1f35cddc0 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
+	github.com/klauspost/cpuid/v2 v2.2.9 // indirect
 	github.com/libp2p/go-reuseport v0.4.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect
 	github.com/mdlayher/netlink v1.7.2 // indirect

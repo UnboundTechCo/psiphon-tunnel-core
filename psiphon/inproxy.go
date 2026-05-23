@@ -41,6 +41,7 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/parameters"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/resolver"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/tun"
 	utls "github.com/Psiphon-Labs/utls"
 	"github.com/cespare/xxhash"
 )
@@ -434,6 +435,28 @@ func NewInproxyBrokerClientInstance(
 		PRNG := prng.NewPRNGWithSeed(&seed)
 
 		permutedIndexes := PRNG.Perm(len(brokerSpecs))
+
+		// Minimize rendezvous time by reducing the number of brokers this
+		// personal compartment ID maps over to. With a reduced number of
+		// possible brokers, the client and proxy have fewer brokers to check
+		// after fail overs.
+		//
+		// Given that permutedIndexes is a randomized shuffle, each personal
+		// compartment ID will map to a different set of reduced brokers,
+		// preserving overall broker load balancing.
+		//
+		// InproxyPersonalPairingMaxBrokerSpecCount will be configured high
+		// enough to also preserve reasonable availability when brokers fail.
+		// When InproxyPersonalPairingMaxBrokerSpecCount is 0, there is no max.
+		//
+		// This scheme depends on the len(personalCompartmentIDs) <= 1
+		// constraint checked above.
+
+		maxBrokerSpecs := p.Int(parameters.InproxyPersonalPairingMaxBrokerSpecCount)
+		if maxBrokerSpecs > 0 && len(permutedIndexes) > maxBrokerSpecs {
+			permutedIndexes = permutedIndexes[:maxBrokerSpecs]
+		}
+
 		selectedIndex := permutedIndexes[brokerSelectCount%len(permutedIndexes)]
 		brokerSpecs = brokerSpecs[selectedIndex : selectedIndex+1]
 
@@ -1981,6 +2004,8 @@ func (w *InproxyWebRTCDialInstance) ProxyUpstreamDial(
 	// DNSResolverPreresolvedIPAddressCIDRs proxy tactics. In addition,
 	// replay the selected upstream dial tactics parameters.
 
+	splitUpstreamInterfaceName := w.config.InproxyProxySplitUpstreamInterfaceName
+
 	dialer := net.Dialer{
 		Control: func(_, _ string, c syscall.RawConn) error {
 			var controlErr error
@@ -1992,6 +2017,12 @@ func (w *InproxyWebRTCDialInstance) ProxyUpstreamDial(
 
 				if w.config.deviceBinder != nil {
 					_, err := w.config.deviceBinder.BindToDevice(socketFD)
+					if err != nil {
+						controlErr = errors.Tracef("BindToDevice failed: %s", err)
+						return
+					}
+				} else if splitUpstreamInterfaceName != "" {
+					err := tun.BindToDevice(socketFD, splitUpstreamInterfaceName)
 					if err != nil {
 						controlErr = errors.Tracef("BindToDevice failed: %s", err)
 						return
@@ -2145,15 +2176,18 @@ func (dialParams *InproxySTUNDialParameters) Prepare() {
 // STUN server candidates for in-proxy clients.
 func (dialParams *InproxySTUNDialParameters) IsValidClientReplay(
 	p parameters.ParametersAccessor) bool {
-
 	return (dialParams.STUNServerAddress == "" ||
 		common.Contains(
-			p.Strings(parameters.InproxyClientSTUNServerAddresses),
+			p.Strings(
+				parameters.InproxyClientSTUNServerAddresses,
+				parameters.InproxySTUNServerAddresses),
 			dialParams.STUNServerAddress)) &&
 
 		(dialParams.STUNServerAddressRFC5780 == "" ||
 			common.Contains(
-				p.Strings(parameters.InproxyClientSTUNServerAddressesRFC5780),
+				p.Strings(
+					parameters.InproxyClientSTUNServerAddressesRFC5780,
+					parameters.InproxySTUNServerAddressesRFC5780),
 				dialParams.STUNServerAddressRFC5780))
 }
 

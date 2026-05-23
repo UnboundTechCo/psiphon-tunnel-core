@@ -58,8 +58,10 @@ func TestBoltResiliency(t *testing.T) {
         "ClientVersion" : "0000000000000000",
         "SponsorId" : "0000000000000000",
         "PropagationChannelId" : "0",
-        "ConnectionWorkerPoolSize" : 10,
-        "EstablishTunnelTimeoutSeconds" : 1,
+        "DisableTactics" : true,
+        "ConnectionWorkerPoolSize" : 1,
+        "TunnelConnectTimeoutSeconds" : 1,
+        "EstablishTunnelTimeoutSeconds" : 0,
         "EstablishTunnelPausePeriodSeconds" : 1
     }`
 
@@ -79,8 +81,9 @@ func TestBoltResiliency(t *testing.T) {
 
 	noticeCandidateServers := make(chan struct{}, 1)
 	noticeExiting := make(chan struct{}, 1)
-	noticeResetDatastore := make(chan struct{}, 1)
+	noticeOpenResetDatastore := make(chan struct{}, 1)
 	noticeDatastoreFailed := make(chan struct{}, 1)
+	noticeFailedResetDatastore := make(chan struct{}, 1)
 
 	err = SetNoticeWriter(NewNoticeReceiver(
 		func(notice []byte) {
@@ -107,13 +110,15 @@ func TestBoltResiliency(t *testing.T) {
 				case noticeExiting <- struct{}{}:
 				default:
 				}
-			case "Alert":
+			case "Warning":
 				message := payload["message"].(string)
 				var channel chan struct{}
 				if strings.Contains(message, "tryDatastoreOpenDB: reset") {
-					channel = noticeResetDatastore
+					channel = noticeOpenResetDatastore
 				} else if strings.Contains(message, "datastore has failed") {
 					channel = noticeDatastoreFailed
+				} else if strings.Contains(message, "reset failed datastore") {
+					channel = noticeFailedResetDatastore
 				}
 				if channel != nil {
 					select {
@@ -135,7 +140,7 @@ func TestBoltResiliency(t *testing.T) {
 	drainNoticeChannel := func(channel chan struct{}) {
 		for {
 			select {
-			case channel <- struct{}{}:
+			case <-channel:
 			default:
 				return
 			}
@@ -145,14 +150,15 @@ func TestBoltResiliency(t *testing.T) {
 	drainNoticeChannels := func() {
 		drainNoticeChannel(noticeCandidateServers)
 		drainNoticeChannel(noticeExiting)
-		drainNoticeChannel(noticeResetDatastore)
+		drainNoticeChannel(noticeOpenResetDatastore)
 		drainNoticeChannel(noticeDatastoreFailed)
+		drainNoticeChannel(noticeFailedResetDatastore)
 	}
 
 	// Paving sufficient server entries, then truncating the datastore file to
 	// remove some server entry data, then iterating over all server entries (to
 	// produce the CandidateServers output) triggers datastore corruption
-	// detection and, at start up, reset/recovery.
+	// detection and reset/recovery.
 
 	paveServerEntries := func() {
 		for i := 0; i < serverEntryCount; i++ {
@@ -197,6 +203,27 @@ func TestBoltResiliency(t *testing.T) {
 		}
 	}
 
+	corruptDataStore := func() {
+		filename := filepath.Join(testDataDirName, "ca.psiphon.PsiphonTunnel.tunnel-core", "datastore", "psiphon.boltdb")
+		file, err := os.OpenFile(filename, os.O_RDWR, 0666)
+		if err != nil {
+			t.Fatalf("OpenFile failed: %s", err)
+		}
+		defer file.Close()
+		fileInfo, err := file.Stat()
+		if err != nil {
+			t.Fatalf("Stat failed: %s", err)
+		}
+		_, err = file.WriteAt(prng.Bytes(int(fileInfo.Size())), 0)
+		if err != nil {
+			t.Fatalf("WriteAt failed: %s", err)
+		}
+		err = file.Sync()
+		if err != nil {
+			t.Fatalf("Sync failed: %s", err)
+		}
+	}
+
 	truncateDataStore := func() {
 		filename := filepath.Join(testDataDirName, "ca.psiphon.PsiphonTunnel.tunnel-core", "datastore", "psiphon.boltdb")
 		file, err := os.OpenFile(filename, os.O_RDWR, 0666)
@@ -237,19 +264,19 @@ func TestBoltResiliency(t *testing.T) {
 
 	drainNoticeChannels()
 
-	// Truncate datastore file before running controller; expect a datastore
+	// Corrupt datastore file before running controller; expect a datastore
 	// "reset" notice on OpenDataStore.
 
 	t.Logf("test: recover from datastore corrupted before opening")
 
-	truncateDataStore()
+	corruptDataStore()
 
 	err = OpenDataStore(clientConfig)
 	if err != nil {
 		t.Fatalf("OpenDataStore failed: %s", err)
 	}
 
-	<-noticeResetDatastore
+	<-noticeOpenResetDatastore
 
 	if !canTruncateOpenDataStore {
 		CloseDataStore()
@@ -260,7 +287,7 @@ func TestBoltResiliency(t *testing.T) {
 
 	// Truncate datastore while running the controller. First, complete one
 	// successful data scan (CandidateServers). The next scan should trigger a
-	// datastore "failed" notice.
+	// datastore "failed" notice and datastore reset.
 
 	t.Logf("test: detect corrupt datastore while running")
 
@@ -272,6 +299,8 @@ func TestBoltResiliency(t *testing.T) {
 
 	<-noticeDatastoreFailed
 
+	<-noticeFailedResetDatastore
+
 	<-noticeExiting
 
 	stopController()
@@ -280,16 +309,14 @@ func TestBoltResiliency(t *testing.T) {
 
 	drainNoticeChannels()
 
-	// Restart successfully after previous failure shutdown.
+	// Restart successfully after previous failure reset and shutdown.
 
-	t.Logf("test: after restart, recover from datastore corrupted while running")
+	t.Logf("test: after restart, recover from reset datastore")
 
 	err = OpenDataStore(clientConfig)
 	if err != nil {
 		t.Fatalf("OpenDataStore failed: %s", err)
 	}
-
-	<-noticeResetDatastore
 
 	paveServerEntries()
 
