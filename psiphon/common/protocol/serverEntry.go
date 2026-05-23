@@ -474,6 +474,10 @@ func GetCapability(protocol string) string {
 
 	protocol = TunnelProtocolBase(protocol)
 
+	if protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_CDN {
+		return strings.TrimSuffix(TUNNEL_PROTOCOL_FRONTED_MEEK, "-OSSH")
+	}
+
 	if TunnelProtocolUsesInproxy(protocol) {
 		return protocol
 	}
@@ -769,6 +773,7 @@ func (serverEntry *ServerEntry) GetDialPortNumber(tunnelProtocol string) (int, e
 			return serverEntry.SshObfuscatedQUICPort, nil
 
 		case TUNNEL_PROTOCOL_FRONTED_MEEK,
+			TUNNEL_PROTOCOL_FRONTED_MEEK_CDN,
 			TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH:
 			return int(atomic.LoadInt32(&frontedMeekHTTPSDialPortNumber)), nil
 
@@ -808,6 +813,7 @@ func (serverEntry *ServerEntry) GetDialPortNumber(tunnelProtocol string) (int, e
 			return serverEntry.InproxyQUICPort, nil
 
 		case TUNNEL_PROTOCOL_FRONTED_MEEK,
+			TUNNEL_PROTOCOL_FRONTED_MEEK_CDN,
 			TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH:
 			return int(atomic.LoadInt32(&frontedMeekHTTPSDialPortNumber)), nil
 

@@ -175,6 +175,11 @@ type Config struct {
 	// free port (a notice reporting the selected port is emitted).
 	LocalHttpProxyPort int `json:",omitempty"`
 
+	// LocalProxyUsername and LocalProxyPassword enable downstream proxy
+	// authentication for the local HTTP and SOCKS proxies when both are set.
+	LocalProxyUsername string `json:",omitempty"`
+	LocalProxyPassword string `json:",omitempty"`
+
 	// DisableLocalHTTPProxy disables running the local HTTP proxy.
 	DisableLocalHTTPProxy bool `json:",omitempty"`
 

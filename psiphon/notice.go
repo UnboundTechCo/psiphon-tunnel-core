@@ -537,10 +537,17 @@ func noticeWithDialParameters(noticeType string, dialParams *DialParameters, pos
 
 		if protocol.TunnelProtocolUsesFrontedMeek(dialParams.TunnelProtocol) {
 
-			meekResolvedIPAddress := dialParams.MeekResolvedIPAddress.Load().(string)
+			meekResolvedIPAddress, _ := dialParams.MeekResolvedIPAddress.Load().(string)
 			if meekResolvedIPAddress != "" {
 				nonredacted := common.EscapeRedactIPAddressString(meekResolvedIPAddress)
 				args = append(args, "meekResolvedIPAddress", nonredacted)
+			}
+		}
+
+		if postDial {
+			if routeBypassIPAddress := routeBypassIPAddressForNotice(dialParams); routeBypassIPAddress != "" {
+				nonredacted := common.EscapeRedactIPAddressString(routeBypassIPAddress)
+				args = append(args, "routeBypassIPAddress", nonredacted)
 			}
 		}
 
@@ -721,6 +728,51 @@ func noticeWithDialParameters(noticeType string, dialParams *DialParameters, pos
 	singletonNoticeLogger.outputNotice(
 		noticeType, noticeIsDiagnostic,
 		args...)
+}
+
+func routeBypassIPAddressForNotice(dialParams *DialParameters) string {
+	candidates := make([]string, 0, 6)
+
+	if value := dialParams.MeekResolvedIPAddress.Load(); value != nil {
+		if meekResolvedIPAddress, ok := value.(string); ok && meekResolvedIPAddress != "" {
+			candidates = append(candidates, meekResolvedIPAddress)
+		}
+	}
+
+	if dialParams.SteeringIP != "" {
+		candidates = append(candidates, dialParams.SteeringIP)
+	}
+
+	if dialParams.ResolveParameters != nil &&
+		dialParams.ResolveParameters.PreresolvedIPAddress != "" {
+		candidates = append(candidates, dialParams.ResolveParameters.PreresolvedIPAddress)
+	}
+
+	for _, address := range []string{dialParams.DirectDialAddress, dialParams.MeekDialAddress} {
+		if address == "" {
+			continue
+		}
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			host = address
+		}
+		if host != "" {
+			candidates = append(candidates, host)
+		}
+	}
+
+	if dialParams.ServerEntry != nil && dialParams.ServerEntry.IpAddress != "" {
+		candidates = append(candidates, dialParams.ServerEntry.IpAddress)
+	}
+
+	for _, candidate := range candidates {
+		ip := net.ParseIP(candidate)
+		if ip == nil || ip.To4() == nil {
+			continue
+		}
+		return ip.String()
+	}
+	return ""
 }
 
 // NoticeConnectingServer reports parameters and details for a single connection attempt

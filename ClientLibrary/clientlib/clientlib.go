@@ -145,6 +145,7 @@ func StartTunnel(
 
 	// Will be closed when the tunnel has successfully connected
 	connectedSignal := make(chan struct{})
+	connectedSignalOnce := new(sync.Once)
 	// Will receive a value if an error occurs during the connection sequence
 	erroredCh := make(chan error, 1)
 
@@ -182,7 +183,9 @@ func StartTunnel(
 			} else if event.Type == "Tunnels" {
 				count := event.Data["count"].(float64)
 				if count > 0 {
-					close(connectedSignal)
+					connectedSignalOnce.Do(func() {
+						close(connectedSignal)
+					})
 				}
 			}
 
