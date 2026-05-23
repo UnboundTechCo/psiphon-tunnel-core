@@ -157,8 +157,10 @@ type Config struct {
 	// protocols include:
 	// "SSH", "OSSH", "TLS-OSSH", "UNFRONTED-MEEK-OSSH", "UNFRONTED-MEEK-HTTPS-OSSH",
 	// "UNFRONTED-MEEK-SESSION-TICKET-OSSH", "FRONTED-MEEK-OSSH",
-	// "FRONTED-MEEK-QUIC-OSSH", "FRONTED-MEEK-HTTP-OSSH", "QUIC-OSSH",
-	// "TAPDANCE-OSSH", "CONJURE-OSSH", and "SHADOWSOCKS-OSSH".
+	// "FRONTED-MEEK-CDN-OSSH", "FRONTED-MEEK-QUIC-OSSH",
+	// "FRONTED-MEEK-CDN-QUIC-OSSH", "FRONTED-MEEK-HTTP-OSSH",
+	// "FRONTED-MEEK-CDN-HTTP-OSSH", "QUIC-OSSH", "TAPDANCE-OSSH",
+	// "CONJURE-OSSH", and "SHADOWSOCKS-OSSH".
 	TunnelProtocolPorts map[string]int `json:",omitempty"`
 
 	// TunnelProtocolPassthroughAddresses specifies passthrough addresses to be

@@ -43,8 +43,10 @@ const (
 	TUNNEL_PROTOCOL_FRONTED_MEEK                     = "FRONTED-MEEK-OSSH"
 	TUNNEL_PROTOCOL_FRONTED_MEEK_CDN                 = "FRONTED-MEEK-CDN-OSSH"
 	TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP                = "FRONTED-MEEK-HTTP-OSSH"
+	TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP_CDN            = "FRONTED-MEEK-CDN-HTTP-OSSH"
 	TUNNEL_PROTOCOL_QUIC_OBFUSCATED_SSH              = "QUIC-OSSH"
 	TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH = "FRONTED-MEEK-QUIC-OSSH"
+	TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH       = "FRONTED-MEEK-CDN-QUIC-OSSH"
 	TUNNEL_PROTOCOL_TAPDANCE_OBFUSCATED_SSH          = "TAPDANCE-OSSH"
 	TUNNEL_PROTOCOL_CONJURE_OBFUSCATED_SSH           = "CONJURE-OSSH"
 
@@ -231,8 +233,10 @@ var SupportedTunnelProtocols = TunnelProtocols{
 	TUNNEL_PROTOCOL_FRONTED_MEEK,
 	TUNNEL_PROTOCOL_FRONTED_MEEK_CDN,
 	TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP,
+	TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP_CDN,
 	TUNNEL_PROTOCOL_QUIC_OBFUSCATED_SSH,
 	TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH,
+	TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH,
 	TUNNEL_PROTOCOL_TAPDANCE_OBFUSCATED_SSH,
 	TUNNEL_PROTOCOL_CONJURE_OBFUSCATED_SSH,
 	TUNNEL_PROTOCOL_SHADOWSOCKS_OSSH,
@@ -240,6 +244,7 @@ var SupportedTunnelProtocols = TunnelProtocols{
 
 var DefaultDisabledTunnelProtocols = TunnelProtocols{
 	TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH,
+	TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH,
 	TUNNEL_PROTOCOL_TAPDANCE_OBFUSCATED_SSH,
 	TUNNEL_PROTOCOL_CONJURE_OBFUSCATED_SSH,
 }
@@ -308,7 +313,8 @@ func TunnelProtocolIsCompatibleWithInproxy(protocol string) bool {
 func TunnelProtocolUsesTCP(protocol string) bool {
 	protocol = TunnelProtocolMinusInproxy(protocol)
 	return protocol != TUNNEL_PROTOCOL_QUIC_OBFUSCATED_SSH &&
-		protocol != TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH
+		protocol != TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH &&
+		protocol != TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH
 }
 
 func TunnelProtocolUsesSSH(protocol string) bool {
@@ -345,18 +351,23 @@ func TunnelProtocolUsesFrontedMeek(protocol string) bool {
 	return protocol == TUNNEL_PROTOCOL_FRONTED_MEEK ||
 		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_CDN ||
 		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP ||
-		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH
+		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP_CDN ||
+		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH ||
+		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH
 }
 
 func TunnelProtocolUsesFrontedMeekCDN(protocol string) bool {
 	protocol = TunnelProtocolMinusInproxy(protocol)
-	return protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_CDN
+	return protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_CDN ||
+		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP_CDN ||
+		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH
 }
 
 func TunnelProtocolUsesMeekHTTP(protocol string) bool {
 	protocol = TunnelProtocolMinusInproxy(protocol)
 	return protocol == TUNNEL_PROTOCOL_UNFRONTED_MEEK ||
-		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP
+		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP ||
+		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP_CDN
 }
 
 func TunnelProtocolUsesMeekHTTPNormalizer(protocol string) bool {
@@ -380,18 +391,22 @@ func TunnelProtocolUsesObfuscatedSessionTickets(protocol string) bool {
 func TunnelProtocolUsesQUIC(protocol string) bool {
 	protocol = TunnelProtocolMinusInproxy(protocol)
 	return protocol == TUNNEL_PROTOCOL_QUIC_OBFUSCATED_SSH ||
-		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH
+		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH ||
+		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH
 }
 
 func TunnelProtocolUsesFrontedMeekQUIC(protocol string) bool {
 	protocol = TunnelProtocolMinusInproxy(protocol)
-	return protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH
+	return protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH ||
+		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH
 }
 
 func TunnelProtocolUsesFrontedMeekNonHTTPS(protocol string) bool {
 	protocol = TunnelProtocolMinusInproxy(protocol)
 	return protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP ||
-		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH
+		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP_CDN ||
+		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH ||
+		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH
 }
 
 func TunnelProtocolUsesRefractionNetworking(protocol string) bool {
@@ -430,6 +445,7 @@ func TunnelProtocolIsCompatibleWithFragmentor(protocol string) bool {
 		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK ||
 		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_CDN ||
 		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP ||
+		protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP_CDN ||
 		protocol == TUNNEL_PROTOCOL_CONJURE_OBFUSCATED_SSH ||
 		protocol == TUNNEL_PROTOCOL_SHADOWSOCKS_OSSH
 }
@@ -490,6 +506,10 @@ func TunnelProtocolBase(protocol string) string {
 	baseProtocol := TunnelProtocolMinusInproxy(protocol)
 	if baseProtocol == TUNNEL_PROTOCOL_FRONTED_MEEK_CDN {
 		baseProtocol = TUNNEL_PROTOCOL_FRONTED_MEEK
+	} else if baseProtocol == TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP_CDN {
+		baseProtocol = TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP
+	} else if baseProtocol == TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH {
+		baseProtocol = TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH
 	}
 	if inproxy {
 		return TunnelProtocolPlusInproxyWebRTC(baseProtocol)
@@ -513,7 +533,8 @@ func TunnelProtocolMayUseClientBPF(protocol string) bool {
 		return false
 	}
 	return protocol != TUNNEL_PROTOCOL_QUIC_OBFUSCATED_SSH &&
-		protocol != TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH
+		protocol != TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH &&
+		protocol != TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH
 }
 
 func IsValidClientTunnelProtocol(

@@ -49,6 +49,10 @@ func TestDialParametersAndReplay(t *testing.T) {
 	}
 }
 
+func TestFrontedMeekQUICCDNDialParametersAndReplay(t *testing.T) {
+	runDialParametersAndReplay(t, protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH)
+}
+
 var testNetworkID = prng.HexString(8)
 
 type testNetworkGetter struct {
@@ -143,6 +147,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 				DialAddresses:           []string{"cdn.example.org"},
 				SNIServerName:           "cdn.example.org",
 				VerifyServerNames:       []string{"cdn.example.org"},
+				VerifyPins:              []string{"pin"},
 				ALPNProtocols:           []string{"http/1.1"},
 			},
 		}
@@ -270,6 +275,46 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 			if dialParams.QUICDialSNIAddress == "" {
 				t.Fatalf("missing QUIC SNI field")
 			}
+		}
+	}
+
+	if tunnelProtocol == protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH {
+		if dialParams.MeekFrontingDialOverrideID != "test-cdn" {
+			t.Fatalf("missing CDN dial override ID")
+		}
+		if dialParams.MeekFrontingDialAddress != "cdn.example.org" {
+			t.Fatalf("unexpected CDN dial address: %s", dialParams.MeekFrontingDialAddress)
+		}
+		if dialParams.MeekDialAddress != "cdn.example.org:443" {
+			t.Fatalf("unexpected CDN meek dial address: %s", dialParams.MeekDialAddress)
+		}
+		if dialParams.MeekSNIServerName != "cdn.example.org" {
+			t.Fatalf("unexpected CDN QUIC SNI: %s", dialParams.MeekSNIServerName)
+		}
+		if len(dialParams.MeekVerifyServerNames) != 0 ||
+			dialParams.MeekVerifyServerName != "" ||
+			len(dialParams.MeekVerifyPins) != 0 ||
+			len(dialParams.MeekTLSALPNProtocols) != 0 {
+			t.Fatalf("QUIC CDN retained unsupported TLS verification override fields")
+		}
+		if dialParams.SelectedTLSProfile ||
+			dialParams.TLSProfile != "" ||
+			dialParams.RandomizedTLSProfileSeed != nil {
+			t.Fatalf("QUIC CDN retained unsupported TLS profile fields")
+		}
+		if dialParams.meekConfig == nil {
+			t.Fatalf("missing CDN QUIC meek config")
+		}
+		if !dialParams.meekConfig.UseQUIC ||
+			dialParams.meekConfig.UseHTTPS ||
+			dialParams.meekConfig.DialAddress != dialParams.MeekDialAddress ||
+			dialParams.meekConfig.SNIServerName != dialParams.MeekSNIServerName ||
+			dialParams.meekConfig.ClientTunnelProtocol != protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH ||
+			len(dialParams.meekConfig.VerifyServerNames) != 0 ||
+			len(dialParams.meekConfig.VerifyPins) != 0 ||
+			len(dialParams.meekConfig.ALPNProtocols) != 0 ||
+			dialParams.meekConfig.TLSProfile != "" {
+			t.Fatalf("unexpected CDN QUIC meek config")
 		}
 	}
 
@@ -1582,6 +1627,115 @@ func TestFrontedMeekCDNDialOverrideCandidateNumber(t *testing.T) {
 			if candidateNumber != testCase.expectedCandidateNum {
 				t.Fatalf("got %d, expected %d",
 					candidateNumber, testCase.expectedCandidateNum)
+			}
+		})
+	}
+}
+
+func TestFrontedMeekCDNDialOverrideProtocolConstraints(t *testing.T) {
+
+	testCases := []struct {
+		name                      string
+		tunnelProtocol            string
+		inputSNI                  string
+		originalSNI               string
+		frontingDialAddress       string
+		expectedSNI               string
+		expectTransformedHostName bool
+		expectVerifyServerNames   bool
+		expectVerifyPins          bool
+		expectALPNProtocols       bool
+		expectSelectedTLSProfile  bool
+	}{
+		{
+			name:                      "HTTPS CDN keeps TLS override fields",
+			tunnelProtocol:            protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_CDN,
+			inputSNI:                  "cdn.example.org",
+			expectedSNI:               "cdn.example.org",
+			expectTransformedHostName: true,
+			expectVerifyServerNames:   true,
+			expectVerifyPins:          true,
+			expectALPNProtocols:       true,
+			expectSelectedTLSProfile:  true,
+		},
+		{
+			name:           "HTTP CDN drops TLS-only override fields",
+			tunnelProtocol: protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP_CDN,
+			inputSNI:       "cdn.example.org",
+		},
+		{
+			name:                      "QUIC CDN keeps SNI but drops unsupported verification fields",
+			tunnelProtocol:            protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH,
+			inputSNI:                  "cdn.example.org",
+			originalSNI:               "original.example.org",
+			expectedSNI:               "cdn.example.org",
+			expectTransformedHostName: true,
+		},
+		{
+			name:           "QUIC CDN keeps disabled SNI disabled",
+			tunnelProtocol: protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH,
+			originalSNI:    "original.example.org",
+		},
+		{
+			name:                      "QUIC CDN preserves original SNI for IP edge overrides",
+			tunnelProtocol:            protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH,
+			inputSNI:                  "192.0.2.1",
+			originalSNI:               "a1234.g.akamai.net",
+			expectedSNI:               "a1234.g.akamai.net",
+			expectTransformedHostName: true,
+		},
+		{
+			name:                      "QUIC CDN prefers fronting dial address for IP edge overrides",
+			tunnelProtocol:            protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH,
+			inputSNI:                  "192.0.2.1",
+			originalSNI:               "transformed.example.org",
+			frontingDialAddress:       "a1234.g.akamai.net",
+			expectedSNI:               "a1234.g.akamai.net",
+			expectTransformedHostName: true,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			dialParams := &DialParameters{
+				TunnelProtocol:           testCase.tunnelProtocol,
+				MeekSNIServerName:        testCase.inputSNI,
+				MeekFrontingDialAddress:  testCase.frontingDialAddress,
+				MeekVerifyServerName:     "cdn.example.org",
+				MeekVerifyServerNames:    []string{"cdn.example.org"},
+				MeekVerifyPins:           []string{"pin"},
+				MeekTLSALPNProtocols:     []string{"h2", "http/1.1"},
+				SelectedTLSProfile:       true,
+				TLSProfile:               protocol.TLS_PROFILE_CHROME_83,
+				RandomizedTLSProfileSeed: new(prng.Seed),
+				MeekTransformedHostName:  true,
+			}
+
+			dialParams.applyFrontedMeekDialOverrideProtocolConstraints(testCase.originalSNI)
+
+			if dialParams.MeekSNIServerName != testCase.expectedSNI {
+				t.Fatalf("unexpected SNI state: %s", dialParams.MeekSNIServerName)
+			}
+			if dialParams.MeekTransformedHostName != testCase.expectTransformedHostName {
+				t.Fatalf("unexpected transformed host name state")
+			}
+			if (len(dialParams.MeekVerifyServerNames) > 0) != testCase.expectVerifyServerNames {
+				t.Fatalf("unexpected verify server names state")
+			}
+			if (len(dialParams.MeekVerifyPins) > 0) != testCase.expectVerifyPins {
+				t.Fatalf("unexpected verify pins state")
+			}
+			if (len(dialParams.MeekTLSALPNProtocols) > 0) != testCase.expectALPNProtocols {
+				t.Fatalf("unexpected ALPN protocols state")
+			}
+			if dialParams.SelectedTLSProfile != testCase.expectSelectedTLSProfile {
+				t.Fatalf("unexpected selected TLS profile state")
+			}
+			if (dialParams.TLSProfile != "") != testCase.expectSelectedTLSProfile {
+				t.Fatalf("unexpected TLS profile state")
+			}
+			if (dialParams.RandomizedTLSProfileSeed != nil) != testCase.expectSelectedTLSProfile {
+				t.Fatalf("unexpected randomized TLS profile seed state")
 			}
 		})
 	}

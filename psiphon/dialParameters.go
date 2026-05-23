@@ -1514,7 +1514,8 @@ func MakeDialParameters(
 
 	case protocol.TUNNEL_PROTOCOL_FRONTED_MEEK,
 		protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_CDN,
-		protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH:
+		protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH,
+		protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH:
 
 		dialParams.MeekDialAddress = net.JoinHostPort(dialParams.MeekFrontingDialAddress, dialParams.DialPortNumber)
 		dialParams.MeekHostHeader = dialParams.MeekFrontingHost
@@ -1526,7 +1527,8 @@ func MakeDialParameters(
 			dialParams.MeekSNIServerName = dialParams.MeekFrontingDialAddress
 		}
 
-	case protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP:
+	case protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP,
+		protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP_CDN:
 
 		dialParams.MeekDialAddress = net.JoinHostPort(dialParams.MeekFrontingDialAddress, dialParams.DialPortNumber)
 		dialParams.MeekHostHeader = dialParams.MeekFrontingHost
@@ -2278,6 +2280,8 @@ func (dialParams *DialParameters) applyFrontedMeekDialOverride(
 		return false, nil
 	}
 
+	originalMeekSNIServerName := dialParams.MeekSNIServerName
+
 	dialParams.MeekFrontingDialOverrideID = override.OverrideID
 	dialParams.MeekFrontingDialAddress = override.DialAddress
 	dialParams.MeekDialAddress = net.JoinHostPort(
@@ -2295,7 +2299,8 @@ func (dialParams *DialParameters) applyFrontedMeekDialOverride(
 	dialParams.MeekVerifyPins = override.VerifyPins
 	dialParams.MeekTLSALPNProtocols = override.ALPNProtocols
 
-	if override.TLSProfile != "" {
+	if override.TLSProfile != "" &&
+		protocol.TunnelProtocolUsesMeekHTTPS(dialParams.TunnelProtocol) {
 		err = dialParams.applyFrontedMeekDialOverrideTLSProfile(
 			p, override.TLSProfile)
 		if err != nil {
@@ -2303,7 +2308,68 @@ func (dialParams *DialParameters) applyFrontedMeekDialOverride(
 		}
 	}
 
+	dialParams.applyFrontedMeekDialOverrideProtocolConstraints(originalMeekSNIServerName)
+
 	return true, nil
+}
+
+func (dialParams *DialParameters) applyFrontedMeekDialOverrideProtocolConstraints(
+	originalMeekSNIServerName string) {
+
+	switch protocol.TunnelProtocolMinusInproxy(dialParams.TunnelProtocol) {
+	case protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP_CDN:
+		// The HTTP fronted transport only consumes the dial address and Host
+		// header; TLS/SNI override fields do not apply.
+		dialParams.MeekSNIServerName = ""
+		dialParams.MeekVerifyServerNames = nil
+		dialParams.MeekVerifyServerName = ""
+		dialParams.MeekVerifyPins = nil
+		dialParams.MeekTLSALPNProtocols = nil
+		dialParams.SelectedTLSProfile = false
+		dialParams.TLSProfile = ""
+		dialParams.RandomizedTLSProfileSeed = nil
+		dialParams.MeekTransformedHostName = false
+
+	case protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH:
+		// QUIC meek currently supports overriding the dial address and SNI, but
+		// not custom certificate verification or TLS ClientHello parameters.
+		fallbackSNIServerName :=
+			dialParams.frontedMeekQUICCDNFallbackSNI(originalMeekSNIServerName)
+		if dialParams.MeekSNIServerName == "" {
+			dialParams.MeekTransformedHostName = false
+		} else if net.ParseIP(dialParams.MeekSNIServerName) != nil &&
+			fallbackSNIServerName != "" &&
+			net.ParseIP(fallbackSNIServerName) == nil {
+			// IP address values are omitted from SNI. When the CDN override
+			// points directly at an edge IP, preserve a routable fronting SNI.
+			dialParams.MeekSNIServerName = fallbackSNIServerName
+			dialParams.MeekTransformedHostName = true
+		}
+		dialParams.MeekVerifyServerNames = nil
+		dialParams.MeekVerifyServerName = ""
+		dialParams.MeekVerifyPins = nil
+		dialParams.MeekTLSALPNProtocols = nil
+		dialParams.SelectedTLSProfile = false
+		dialParams.TLSProfile = ""
+		dialParams.RandomizedTLSProfileSeed = nil
+	}
+}
+
+func (dialParams *DialParameters) frontedMeekQUICCDNFallbackSNI(
+	originalMeekSNIServerName string) string {
+
+	if originalMeekSNIServerName == "" {
+		return ""
+	}
+
+	// Prefer the actual selected fronting dial host over a randomized/
+	// transformed SNI; edge IP routing needs a routable CDN name.
+	if dialParams.MeekFrontingDialAddress != "" &&
+		net.ParseIP(dialParams.MeekFrontingDialAddress) == nil {
+		return dialParams.MeekFrontingDialAddress
+	}
+
+	return originalMeekSNIServerName
 }
 
 func (dialParams *DialParameters) frontedMeekCDNDialOverrideCandidateNumber() int {

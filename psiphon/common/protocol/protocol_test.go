@@ -78,6 +78,89 @@ func TestTunnelProtocolValidation(t *testing.T) {
 	}
 }
 
+func TestFrontedMeekCDNProtocolVariants(t *testing.T) {
+
+	testCases := []struct {
+		name               string
+		cdnProtocol        string
+		baseProtocol       string
+		expectedCapability string
+		usesHTTP           bool
+		usesQUIC           bool
+		defaultDisabled    bool
+		inproxyCompatible  bool
+		supportsUpstream   bool
+		mayUseClientBPF    bool
+	}{
+		{
+			name:               "HTTPS",
+			cdnProtocol:        TUNNEL_PROTOCOL_FRONTED_MEEK_CDN,
+			baseProtocol:       TUNNEL_PROTOCOL_FRONTED_MEEK,
+			expectedCapability: "FRONTED-MEEK",
+			supportsUpstream:   true,
+			mayUseClientBPF:    true,
+		},
+		{
+			name:               "HTTP",
+			cdnProtocol:        TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP_CDN,
+			baseProtocol:       TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP,
+			expectedCapability: "FRONTED-MEEK-HTTP",
+			usesHTTP:           true,
+			supportsUpstream:   true,
+			mayUseClientBPF:    true,
+		},
+		{
+			name:               "QUIC",
+			cdnProtocol:        TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH,
+			baseProtocol:       TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH,
+			expectedCapability: "FRONTED-MEEK-QUIC",
+			usesQUIC:           true,
+			defaultDisabled:    true,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			if !common.Contains(SupportedTunnelProtocols, testCase.cdnProtocol) {
+				t.Fatalf("missing supported protocol: %s", testCase.cdnProtocol)
+			}
+			if TunnelProtocolBase(testCase.cdnProtocol) != testCase.baseProtocol {
+				t.Fatalf("unexpected base protocol")
+			}
+			if GetCapability(testCase.cdnProtocol) != testCase.expectedCapability {
+				t.Fatalf("unexpected capability")
+			}
+			if !TunnelProtocolUsesFrontedMeek(testCase.cdnProtocol) {
+				t.Fatalf("expected fronted meek")
+			}
+			if !TunnelProtocolUsesFrontedMeekCDN(testCase.cdnProtocol) {
+				t.Fatalf("expected fronted meek CDN")
+			}
+			if TunnelProtocolUsesMeekHTTP(testCase.cdnProtocol) != testCase.usesHTTP {
+				t.Fatalf("unexpected HTTP classification")
+			}
+			if TunnelProtocolUsesQUIC(testCase.cdnProtocol) != testCase.usesQUIC {
+				t.Fatalf("unexpected QUIC classification")
+			}
+			if common.Contains(DefaultDisabledTunnelProtocols, testCase.cdnProtocol) != testCase.defaultDisabled {
+				t.Fatalf("unexpected default-disabled classification")
+			}
+			if TunnelProtocolIsCompatibleWithInproxy(testCase.cdnProtocol) != testCase.inproxyCompatible {
+				t.Fatalf("unexpected in-proxy compatibility")
+			}
+			if TunnelProtocolSupportsUpstreamProxy(testCase.cdnProtocol) != testCase.supportsUpstream {
+				t.Fatalf("unexpected upstream proxy support")
+			}
+			if TunnelProtocolMayUseClientBPF(testCase.cdnProtocol) != testCase.mayUseClientBPF {
+				t.Fatalf("unexpected client BPF support")
+			}
+			if TunnelProtocolSupportsTactics(testCase.cdnProtocol) {
+				t.Fatalf("CDN variants should not support tactics")
+			}
+		})
+	}
+}
+
 func TestTLSProfileValidation(t *testing.T) {
 
 	// Test: valid profiles
