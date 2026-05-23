@@ -1092,6 +1092,8 @@ type Config struct {
 	// replacement rules.
 	FrontedMeekDialOverrides            parameters.FrontedMeekDialOverrideSpecs `json:",omitempty"`
 	FrontedMeekDialOverridesProbability *float64                                `json:",omitempty"`
+	FrontedMeekCDNScanSpec              parameters.FrontedMeekCDNScanSpec       `json:",omitempty"`
+	FrontedMeekCDNScanUseBuiltInSpec    bool                                    `json:",omitempty"`
 
 	// ConjureCachedRegistrationTTLSeconds and other Conjure fields are for
 	// testing purposes.
@@ -2048,7 +2050,10 @@ func (config *Config) FrontedMeekCDNEnabled() bool {
 		return false
 	}
 	return len(params.Get().FrontedMeekDialOverrides(
-		parameters.FrontedMeekDialOverrides)) > 0
+		parameters.FrontedMeekDialOverrides)) > 0 ||
+		params.Get().Bool(parameters.FrontedMeekCDNScanUseBuiltInSpec) ||
+		!params.Get().FrontedMeekCDNScanSpec(
+			parameters.FrontedMeekCDNScanSpecParameter).IsEmpty()
 }
 
 // SetParameters resets the parameters.Parameters to the default values,
@@ -2728,6 +2733,14 @@ func (config *Config) makeConfigParameters() map[string]interface{} {
 
 	if config.FrontedMeekDialOverridesProbability != nil {
 		applyParameters[parameters.FrontedMeekDialOverridesProbability] = *config.FrontedMeekDialOverridesProbability
+	}
+
+	if !config.FrontedMeekCDNScanSpec.IsEmpty() {
+		applyParameters[parameters.FrontedMeekCDNScanSpecParameter] = config.FrontedMeekCDNScanSpec
+	}
+
+	if config.FrontedMeekCDNScanUseBuiltInSpec {
+		applyParameters[parameters.FrontedMeekCDNScanUseBuiltInSpec] = true
 	}
 
 	if config.ConjureCachedRegistrationTTLSeconds != nil {
@@ -3760,6 +3773,16 @@ func (config *Config) setDialParametersHash() {
 	if config.FrontedMeekDialOverridesProbability != nil {
 		hash.Write([]byte("FrontedMeekDialOverridesProbability"))
 		binary.Write(hash, binary.LittleEndian, *config.FrontedMeekDialOverridesProbability)
+	}
+
+	if !config.FrontedMeekCDNScanSpec.IsEmpty() {
+		hash.Write([]byte("FrontedMeekCDNScanSpec"))
+		encodedSpec, _ := json.Marshal(config.FrontedMeekCDNScanSpec)
+		hash.Write(encodedSpec)
+	}
+
+	if config.FrontedMeekCDNScanUseBuiltInSpec {
+		hash.Write([]byte("FrontedMeekCDNScanUseBuiltInSpec"))
 	}
 
 	if len(config.LightProxyCustomHostNameRegexes) > 0 {

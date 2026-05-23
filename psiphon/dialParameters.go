@@ -72,10 +72,13 @@ type DialParameters struct {
 	CandidateNumber         int                   `json:"-"`
 	EstablishedTunnelsCount int                   `json:"-"`
 
-	ServerEntryIterationUniqueCandidateEstimate   int `json:"-"`
-	ServerEntryIterationMovedToFrontCount         int `json:"-"`
-	ServerEntryIterationFirstFrontedMeekCandidate int `json:"-"`
-	FrontedMeekCDNCandidateNumber                 int `json:"-"`
+	ServerEntryIterationUniqueCandidateEstimate   int  `json:"-"`
+	ServerEntryIterationMovedToFrontCount         int  `json:"-"`
+	ServerEntryIterationFirstFrontedMeekCandidate int  `json:"-"`
+	FrontedMeekCDNCandidateNumber                 int  `json:"-"`
+	FrontedMeekCDNScanCandidate                   bool `json:"-"`
+	frontedMeekCDNScanStateKey                    string
+	frontedMeekCDNScanSelectedCandidate           parameters.FrontedMeekCDNScanCandidate
 
 	IsExchanged bool `json:",omitempty"`
 
@@ -2267,8 +2270,9 @@ func selectFrontingParameters(
 func (dialParams *DialParameters) applyFrontedMeekDialOverride(
 	p parameters.ParametersAccessor) (bool, error) {
 
-	override, ok, err := p.FrontedMeekDialOverrides(
-		parameters.FrontedMeekDialOverrides).SelectCandidateParameters(
+	override, scanCandidate, scanStateKey, ok, err := selectFrontedMeekCDNScanOverride(
+		p,
+		dialParams.NetworkID,
 		dialParams.FrontingProviderID,
 		dialParams.MeekFrontingDialAddress,
 		dialParams.MeekFrontingHost,
@@ -2278,6 +2282,10 @@ func (dialParams *DialParameters) applyFrontedMeekDialOverride(
 	}
 	if !ok {
 		return false, nil
+	} else if scanCandidate != nil {
+		dialParams.FrontedMeekCDNScanCandidate = true
+		dialParams.frontedMeekCDNScanStateKey = scanStateKey
+		dialParams.frontedMeekCDNScanSelectedCandidate = *scanCandidate
 	}
 
 	originalMeekSNIServerName := dialParams.MeekSNIServerName

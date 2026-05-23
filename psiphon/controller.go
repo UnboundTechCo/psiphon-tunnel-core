@@ -2851,6 +2851,10 @@ func (controller *Controller) launchEstablishing() {
 	if controller.config.AggressiveEstablishment {
 		NoticeInfo("beast mode active (workers: %d)", workerPoolSize)
 	}
+	noticeFrontedMeekCDNScanActive(
+		p,
+		workerPoolSize,
+		controller.config.AggressiveEstablishment)
 
 	// TunnelPoolSize may be set by tactics, subject to local constraints. A pool
 	// size of one is forced in packet tunnel mode or when using a
@@ -3342,16 +3346,24 @@ loop:
 					0, excludeIntensive, serverEntry)
 
 				for _, tunnelProtocol := range supportedProtocols {
-					aggressiveCandidate := &candidateServerEntry{
-						serverEntry:                serverEntry,
-						isServerAffinityCandidate:  false,
-						adjustedEstablishStartTime: adjustedEstablishStartTime,
-						preSelectedProtocol:        tunnelProtocol,
+					fanout := 1
+					if protocol.TunnelProtocolUsesFrontedMeekCDN(tunnelProtocol) {
+						fanout = frontedMeekCDNScanCandidateFanout(
+							controller.config.GetParameters().Get(),
+							controller.config.AggressiveEstablishment)
 					}
-					select {
-					case controller.candidateServerEntries <- aggressiveCandidate:
-					case <-controller.establishCtx.Done():
-						break loop
+					for i := 0; i < fanout; i++ {
+						aggressiveCandidate := &candidateServerEntry{
+							serverEntry:                serverEntry,
+							isServerAffinityCandidate:  false,
+							adjustedEstablishStartTime: adjustedEstablishStartTime,
+							preSelectedProtocol:        tunnelProtocol,
+						}
+						select {
+						case controller.candidateServerEntries <- aggressiveCandidate:
+						case <-controller.establishCtx.Done():
+							break loop
+						}
 					}
 				}
 			} else {
@@ -3891,7 +3903,6 @@ loop:
 		DoGarbageCollection()
 
 		if err != nil {
-
 			// Unblock other candidates immediately when server affinity
 			// candidate fails.
 			if candidateServerEntry.isServerAffinityCandidate {
@@ -3904,6 +3915,8 @@ loop:
 				break loop
 			}
 
+			recordFrontedMeekCDNScanResult(dialParams, false)
+
 			NoticeInfo("failed to connect to %s: %v",
 				candidateServerEntry.serverEntry.GetDiagnosticID(),
 				errors.Trace(err))
@@ -3912,6 +3925,8 @@ loop:
 		}
 
 		// Deliver connected tunnel.
+		recordFrontedMeekCDNScanResult(dialParams, true)
+
 		// Don't block. Assumes the receiver has a buffer large enough for
 		// the number of desired tunnels. If there's no room, the tunnel must
 		// not be required so it's discarded.

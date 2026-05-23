@@ -334,6 +334,8 @@ const (
 	RestrictFrontingProviderIDsClientProbability       = "RestrictFrontingProviderIDsClientProbability"
 	FrontedMeekDialOverrides                           = "FrontedMeekDialOverrides"
 	FrontedMeekDialOverridesProbability                = "FrontedMeekDialOverridesProbability"
+	FrontedMeekCDNScanSpecParameter                    = "FrontedMeekCDNScanSpec"
+	FrontedMeekCDNScanUseBuiltInSpec                   = "FrontedMeekCDNScanUseBuiltInSpec"
 	HoldOffDirectTunnelMinDuration                     = "HoldOffDirectTunnelMinDuration"
 	HoldOffDirectTunnelMaxDuration                     = "HoldOffDirectTunnelMaxDuration"
 	HoldOffDirectTunnelProviderRegions                 = "HoldOffDirectTunnelProviderRegions"
@@ -971,6 +973,8 @@ var defaultParameters = map[string]struct {
 	RestrictFrontingProviderIDsClientProbability: {value: 0.0, minimum: 0.0},
 	FrontedMeekDialOverrides:                     {value: FrontedMeekDialOverrideSpecs{}},
 	FrontedMeekDialOverridesProbability:          {value: 1.0, minimum: 0.0},
+	FrontedMeekCDNScanSpecParameter:              {value: FrontedMeekCDNScanSpec{}},
+	FrontedMeekCDNScanUseBuiltInSpec:             {value: false},
 
 	HoldOffDirectTunnelMinDuration:     {value: time.Duration(0), minimum: time.Duration(0)},
 	HoldOffDirectTunnelMaxDuration:     {value: time.Duration(0), minimum: time.Duration(0)},
@@ -1754,6 +1758,14 @@ func (p *Parameters) Set(
 					}
 					return nil, errors.Trace(err)
 				}
+			case FrontedMeekCDNScanSpec:
+				err := v.Validate()
+				if err != nil {
+					if skipOnError {
+						continue
+					}
+					return nil, errors.Trace(err)
+				}
 			case TunnelProtocolPortLists:
 				err := v.Validate()
 				if err != nil {
@@ -2438,6 +2450,13 @@ func (p ParametersAccessor) FrontedMeekDialOverrides(name string) FrontedMeekDia
 	}
 
 	value := FrontedMeekDialOverrideSpecs{}
+	p.snapshot.getValue(name, &value)
+	return value
+}
+
+// FrontedMeekCDNScanSpec returns a FrontedMeekCDNScanSpec parameter value.
+func (p ParametersAccessor) FrontedMeekCDNScanSpec(name string) FrontedMeekCDNScanSpec {
+	value := FrontedMeekCDNScanSpec{}
 	p.snapshot.getValue(name, &value)
 	return value
 }
