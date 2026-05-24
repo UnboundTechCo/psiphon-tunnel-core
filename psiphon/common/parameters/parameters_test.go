@@ -181,6 +181,11 @@ func TestGetDefaultParameters(t *testing.T) {
 			if !reflect.DeepEqual(v, g) {
 				t.Fatalf("FrontedMeekDialOverrideSpecs returned %+v expected %+v", g, v)
 			}
+		case FrontedMeekCDNScanSpec:
+			g := p.Get().FrontedMeekCDNScanSpec(name)
+			if !reflect.DeepEqual(v, g) {
+				t.Fatalf("FrontedMeekCDNScanSpec returned %+v expected %+v", g, v)
+			}
 		case TunnelProtocolPortLists:
 			g := p.Get().TunnelProtocolPortLists(name)
 			if !reflect.DeepEqual(v, g) {
@@ -218,22 +223,32 @@ func TestGetDefaultParameters(t *testing.T) {
 		case InproxyBrokerSpecsValue:
 			g := p.Get().InproxyBrokerSpecs(name)
 			if !reflect.DeepEqual(v, g) {
-				t.Fatalf("ConjureTransports returned %+v expected %+v", g, v)
+				t.Fatalf("InproxyBrokerSpecsValue returned %+v expected %+v", g, v)
 			}
 		case InproxyCompartmentIDsValue:
 			g := p.Get().InproxyCompartmentIDs(name)
 			if !reflect.DeepEqual(v, g) {
-				t.Fatalf("ConjureTransports returned %+v expected %+v", g, v)
+				t.Fatalf("InproxyCompartmentIDsValue returned %+v expected %+v", g, v)
+			}
+		case InproxyKeyCompartmentID:
+			g := p.Get().InproxyKeyCompartmentID(name)
+			if !reflect.DeepEqual(v, g) {
+				t.Fatalf("InproxyKeyCompartmentID returned %+v expected %+v", g, v)
 			}
 		case InproxyTrafficShapingParametersValue:
 			g := p.Get().InproxyTrafficShapingParameters(name)
 			if !reflect.DeepEqual(v, g) {
-				t.Fatalf("ConjureTransports returned %+v expected %+v", g, v)
+				t.Fatalf("InproxyTrafficShapingParametersValue returned %+v expected %+v", g, v)
 			}
 		case LivenessTestSpecs:
 			g := p.Get().LivenessTest(name)
 			if !reflect.DeepEqual(v, g) {
 				t.Fatalf("LivenessTestSpecs returned %+v expected %+v", g, v)
+			}
+		case protocol.DTLSFingerprints:
+			g := p.Get().DTLSFingerprints(name)
+			if !reflect.DeepEqual(v, g) {
+				t.Fatalf("DTLSFingerprints returned %+v expected %+v", g, v)
 			}
 		default:
 			t.Fatalf("Unhandled default type: %s (%T)", name, defaults.value)

@@ -474,6 +474,10 @@ func GetCapability(protocol string) string {
 
 	protocol = TunnelProtocolBase(protocol)
 
+	if protocol == TUNNEL_PROTOCOL_FRONTED_MEEK_CDN {
+		return strings.TrimSuffix(TUNNEL_PROTOCOL_FRONTED_MEEK, "-OSSH")
+	}
+
 	if TunnelProtocolUsesInproxy(protocol) {
 		return protocol
 	}
@@ -1088,9 +1092,7 @@ func encodeServerEntry(
 // used by remote server lists and Psiphon server handshake requests.
 //
 // The resulting ServerEntry.LocalSource is populated with serverEntrySource,
-// which should be one of SERVER_ENTRY_SOURCE_EMBEDDED, SERVER_ENTRY_SOURCE_REMOTE,
-// SERVER_ENTRY_SOURCE_DISCOVERY, SERVER_ENTRY_SOURCE_TARGET,
-// SERVER_ENTRY_SOURCE_OBFUSCATED.
+// which should be one of SupportedServerEntrySources.
 // ServerEntry.LocalTimestamp is populated with the provided timestamp, which
 // should be a RFC 3339 formatted string. These local fields are stored with the
 // server entry and reported to the server as stats (a coarse granularity timestamp

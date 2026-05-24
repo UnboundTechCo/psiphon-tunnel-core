@@ -107,39 +107,42 @@ func (conn *SocksConn) RejectReason(reason byte) error {
 
 // SocksListener wraps a net.Listener in order to read a SOCKS request on Accept.
 //
-// 	func handleConn(conn *pt.SocksConn) error {
-// 		defer conn.Close()
-// 		remote, err := net.Dial("tcp", conn.Req.Target)
-// 		if err != nil {
-// 			conn.Reject()
-// 			return err
-// 		}
-// 		defer remote.Close()
-// 		err = conn.Grant(remote.RemoteAddr().(*net.TCPAddr))
-// 		if err != nil {
-// 			return err
-// 		}
-// 		// do something with conn and remote
-// 		return nil
-// 	}
-// 	...
-// 	ln, err := pt.ListenSocks("tcp", "127.0.0.1:0")
-// 	if err != nil {
-// 		panic(err.Error())
-// 	}
-// 	for {
-// 		conn, err := ln.AcceptSocks()
-// 		if err != nil {
-// 			log.Printf("accept error: %s", err)
-// 			if e, ok := err.(net.Error); !ok || !e.Temporary() {
-// 				break
-// 			}
-// 			continue
-// 		}
-// 		go handleConn(conn)
-// 	}
+//	func handleConn(conn *pt.SocksConn) error {
+//		defer conn.Close()
+//		remote, err := net.Dial("tcp", conn.Req.Target)
+//		if err != nil {
+//			conn.Reject()
+//			return err
+//		}
+//		defer remote.Close()
+//		err = conn.Grant(remote.RemoteAddr().(*net.TCPAddr))
+//		if err != nil {
+//			return err
+//		}
+//		// do something with conn and remote
+//		return nil
+//	}
+//	...
+//	ln, err := pt.ListenSocks("tcp", "127.0.0.1:0")
+//	if err != nil {
+//		panic(err.Error())
+//	}
+//	for {
+//		conn, err := ln.AcceptSocks()
+//		if err != nil {
+//			log.Printf("accept error: %s", err)
+//			if e, ok := err.(net.Error); !ok || !e.Temporary() {
+//				break
+//			}
+//			continue
+//		}
+//		go handleConn(conn)
+//	}
 type SocksListener struct {
 	net.Listener
+	preferUsernamePasswordAuth   bool
+	usernamePasswordAuthRequired func(remoteAddr net.Addr) bool
+	usernamePasswordValidator    func(username, password string) bool
 }
 
 // Open a net.Listener according to network and laddr, and return it as a
@@ -154,7 +157,29 @@ func ListenSocks(network, laddr string) (*SocksListener, error) {
 
 // Create a new SocksListener wrapping the given net.Listener.
 func NewSocksListener(ln net.Listener) *SocksListener {
-	return &SocksListener{ln}
+	return &SocksListener{Listener: ln}
+}
+
+// SetPreferUsernamePasswordAuth makes SOCKS5 negotiation choose RFC1929
+// username/password auth over no-auth when the client offers both.
+func (ln *SocksListener) SetPreferUsernamePasswordAuth(prefer bool) {
+	ln.preferUsernamePasswordAuth = prefer
+}
+
+// SetUsernamePasswordAuthRequired sets a callback used to decide whether
+// RFC1929 username/password auth is required for an accepted SOCKS5 client.
+// When this callback returns true, SOCKS5 negotiation rejects clients that
+// offer only no-auth.
+func (ln *SocksListener) SetUsernamePasswordAuthRequired(
+	authRequired func(remoteAddr net.Addr) bool) {
+	ln.usernamePasswordAuthRequired = authRequired
+}
+
+// SetUsernamePasswordValidator sets a callback used to validate RFC1929
+// username/password credentials during SOCKS5 authentication.
+func (ln *SocksListener) SetUsernamePasswordValidator(
+	validator func(username, password string) bool) {
+	ln.usernamePasswordValidator = validator
 }
 
 // Accept is the same as AcceptSocks, except that it returns a generic net.Conn.
@@ -173,18 +198,18 @@ func (ln *SocksListener) Accept() (net.Conn, error) {
 // temporary and take appropriate action with a type conversion to net.Error.
 // For example:
 //
-// 	for {
-// 		conn, err := ln.AcceptSocks()
-// 		if err != nil {
-// 			if e, ok := err.(net.Error); ok && e.Temporary() {
-// 				log.Printf("temporary accept error; trying again: %s", err)
-// 				continue
-// 			}
-// 			log.Printf("permanent accept error; giving up: %s", err)
-// 			break
-// 		}
-// 		go handleConn(conn)
-// 	}
+//	for {
+//		conn, err := ln.AcceptSocks()
+//		if err != nil {
+//			if e, ok := err.(net.Error); ok && e.Temporary() {
+//				log.Printf("temporary accept error; trying again: %s", err)
+//				continue
+//			}
+//			log.Printf("permanent accept error; giving up: %s", err)
+//			break
+//		}
+//		go handleConn(conn)
+//	}
 func (ln *SocksListener) AcceptSocks() (*SocksConn, error) {
 	c, err := ln.Listener.Accept()
 	if err != nil {
@@ -208,6 +233,12 @@ func (ln *SocksListener) AcceptSocks() (*SocksConn, error) {
 		err = newTemporaryNetError("AcceptSocks: socksPeekByte() failed: %s", err.Error())
 		return nil, err
 	} else if version == socks4Version {
+		if ln.usernamePasswordAuthRequired != nil &&
+			ln.usernamePasswordAuthRequired(conn.RemoteAddr()) {
+			conn.Close()
+			err = newTemporaryNetError("AcceptSocks: SOCKS4 client rejected because username/password auth is required")
+			return nil, err
+		}
 		conn.socksVersion = socks4Version
 		conn.Req, err = readSocks4aConnect(rw.Reader)
 		if err != nil {
@@ -215,8 +246,16 @@ func (ln *SocksListener) AcceptSocks() (*SocksConn, error) {
 			return nil, err
 		}
 	} else if version == socks5Version {
+		preferUsernamePasswordAuth := ln.preferUsernamePasswordAuth
+		if ln.usernamePasswordAuthRequired != nil &&
+			ln.usernamePasswordAuthRequired(conn.RemoteAddr()) {
+			preferUsernamePasswordAuth = true
+		}
 		conn.socksVersion = socks5Version
-		conn.Req, err = socks5Handshake(rw)
+		conn.Req, err = socks5Handshake(
+			rw,
+			preferUsernamePasswordAuth,
+			ln.usernamePasswordValidator)
 		if err != nil {
 			conn.Close()
 			return nil, err
@@ -245,15 +284,18 @@ func (ln *SocksListener) Version() string {
 // socks5handshake conducts the SOCKS5 handshake up to the point where the
 // client command is read and the proxy must open the outgoing connection.
 // Returns a SocksRequest.
-func socks5Handshake(rw *bufio.ReadWriter) (req SocksRequest, err error) {
+func socks5Handshake(
+	rw *bufio.ReadWriter,
+	preferUsernamePasswordAuth bool,
+	usernamePasswordValidator func(username, password string) bool) (req SocksRequest, err error) {
 	// Negotiate the authentication method.
 	var method byte
-	if method, err = socks5NegotiateAuth(rw); err != nil {
+	if method, err = socks5NegotiateAuth(rw, preferUsernamePasswordAuth); err != nil {
 		return
 	}
 
 	// Authenticate the client.
-	if err = socks5Authenticate(rw, method, &req); err != nil {
+	if err = socks5Authenticate(rw, method, usernamePasswordValidator, &req); err != nil {
 		return
 	}
 
@@ -264,7 +306,7 @@ func socks5Handshake(rw *bufio.ReadWriter) (req SocksRequest, err error) {
 
 // socks5NegotiateAuth negotiates the authentication method and returns the
 // selected method as a byte.  On negotiation failures an error is returned.
-func socks5NegotiateAuth(rw *bufio.ReadWriter) (method byte, err error) {
+func socks5NegotiateAuth(rw *bufio.ReadWriter, preferUsernamePasswordAuth bool) (method byte, err error) {
 	// Validate the version.
 	if err = socksReadByteVerify(rw.Reader, "version", socks5Version); err != nil {
 		err = newTemporaryNetError("socks5NegotiateAuth: %s", err.Error())
@@ -288,6 +330,13 @@ func socks5NegotiateAuth(rw *bufio.ReadWriter) (method byte, err error) {
 	// Pick the most "suitable" method.
 	method = socksAuthNoAcceptableMethods
 	for _, m := range methods {
+		if preferUsernamePasswordAuth {
+			switch m {
+			case socksAuthUsernamePassword:
+				method = m
+			}
+			continue
+		}
 		// [Psiphon]
 		// Some SOCKS5 clients send both None and Username/Password when in fact they are only
 		// able to auth with None. Since we don't need pluggable transport parameters and prefer
@@ -335,13 +384,17 @@ func socks5NegotiateAuth(rw *bufio.ReadWriter) (method byte, err error) {
 
 // socks5Authenticate authenticates the client via the chosen authentication
 // mechanism.
-func socks5Authenticate(rw *bufio.ReadWriter, method byte, req *SocksRequest) (err error) {
+func socks5Authenticate(
+	rw *bufio.ReadWriter,
+	method byte,
+	usernamePasswordValidator func(username, password string) bool,
+	req *SocksRequest) (err error) {
 	switch method {
 	case socksAuthNoneRequired:
 		// Straight into reading the connect.
 
 	case socksAuthUsernamePassword:
-		if err = socks5AuthRFC1929(rw, req); err != nil {
+		if err = socks5AuthRFC1929(rw, usernamePasswordValidator, req); err != nil {
 			return
 		}
 
@@ -365,7 +418,10 @@ func socks5Authenticate(rw *bufio.ReadWriter, method byte, req *SocksRequest) (e
 // auth.  As a design decision any valid username/password is accepted as this
 // field is primarily used as an out-of-band argument passing mechanism for
 // pluggable transports.
-func socks5AuthRFC1929(rw *bufio.ReadWriter, req *SocksRequest) (err error) {
+func socks5AuthRFC1929(
+	rw *bufio.ReadWriter,
+	usernamePasswordValidator func(username, password string) bool,
+	req *SocksRequest) (err error) {
 	sendErrResp := func() {
 		// Swallow the write/flush error here, we are going to close the
 		// connection and the original failure is more useful.
@@ -418,6 +474,13 @@ func socks5AuthRFC1929(rw *bufio.ReadWriter, req *SocksRequest) (err error) {
 	if !(plen == 1 && passwd[0] == 0x00) {
 		// tor will set the password to 'NUL' if there are no arguments.
 		req.Password = string(passwd)
+	}
+
+	if usernamePasswordValidator != nil &&
+		!usernamePasswordValidator(req.Username, req.Password) {
+		sendErrResp()
+		err = newTemporaryNetError("socks5AuthRFC1929: invalid username/password")
+		return
 	}
 
 	// [Psiphon]

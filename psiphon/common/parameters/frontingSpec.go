@@ -20,8 +20,12 @@
 package parameters
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"net"
 	"regexp"
+	"strings"
 
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
@@ -94,6 +98,28 @@ type FrontedMeekDialOverrideParameters struct {
 	ALPNProtocols     []string
 	TLSProfile        string
 }
+
+// FrontedMeekCDNScanSpec configures user-provided CDN edge scan candidates.
+// IPCandidates accepts individual IPv4 addresses and IPv4 CIDRs. Each SNI
+// server name is paired with each IP candidate, and each IP candidate is also
+// tried once with SNI omitted.
+type FrontedMeekCDNScanSpec struct {
+	IPCandidates   []string
+	SNIServerNames []string `json:",omitempty"`
+}
+
+// FrontedMeekCDNScanCandidate is a selected edge IP and SNI pair.
+type FrontedMeekCDNScanCandidate struct {
+	IPAddress     string
+	SNIServerName string
+}
+
+type frontedMeekCDNScanIPRange struct {
+	first uint32
+	last  uint32
+}
+
+const maxFrontedMeekCDNScanCandidates = uint64(1<<31 - 1)
 
 // SelectParameters selects fronting parameters from the given FrontingSpecs,
 // first selecting a spec at random. SelectParameters is similar to
@@ -240,6 +266,25 @@ func (overrides FrontedMeekDialOverrideSpecs) SelectParameters(
 	return nil, false, nil
 }
 
+type frontedMeekDialOverrideCandidate struct {
+	override    *FrontedMeekDialOverride
+	dialAddress string
+}
+
+// CandidateCount returns the number of matching override dial candidates.
+func (overrides FrontedMeekDialOverrideSpecs) CandidateCount(
+	frontingProviderID, dialAddress, hostHeader string) (int, error) {
+
+	candidates, err := overrides.matchingCandidates(
+		frontingProviderID,
+		dialAddress,
+		hostHeader)
+	if err != nil {
+		return 0, errors.Trace(err)
+	}
+	return len(candidates), nil
+}
+
 // SelectCandidateParameters selects from all matching overrides and dial
 // addresses in config order. candidateNumber advances through that ordered
 // candidate list, wrapping when all candidates have been tried.
@@ -247,45 +292,17 @@ func (overrides FrontedMeekDialOverrideSpecs) SelectCandidateParameters(
 	frontingProviderID, dialAddress, hostHeader string,
 	candidateNumber int) (*FrontedMeekDialOverrideParameters, bool, error) {
 
-	if len(overrides) == 0 {
-		return nil, false, nil
-	}
 	if candidateNumber < 0 {
 		candidateNumber = 0
 	}
 
-	type candidate struct {
-		override    *FrontedMeekDialOverride
-		dialAddress string
+	candidates, err := overrides.matchingCandidates(
+		frontingProviderID,
+		dialAddress,
+		hostHeader)
+	if err != nil {
+		return nil, false, errors.Trace(err)
 	}
-
-	candidates := make([]candidate, 0)
-
-	for _, override := range overrides {
-		if override == nil {
-			continue
-		}
-		matches, err := override.matches(frontingProviderID, dialAddress, hostHeader)
-		if err != nil {
-			return nil, false, errors.Trace(err)
-		}
-		if !matches {
-			continue
-		}
-		if len(override.DialAddresses) == 0 {
-			return nil, false, errors.TraceNew("missing fronted meek dial override address")
-		}
-		for _, selectedDialAddress := range override.DialAddresses {
-			if selectedDialAddress == "" {
-				return nil, false, errors.TraceNew("empty fronted meek dial override address")
-			}
-			candidates = append(candidates, candidate{
-				override:    override,
-				dialAddress: selectedDialAddress,
-			})
-		}
-	}
-
 	if len(candidates) == 0 {
 		return nil, false, nil
 	}
@@ -294,6 +311,71 @@ func (overrides FrontedMeekDialOverrideSpecs) SelectCandidateParameters(
 	return makeFrontedMeekDialOverrideParameters(
 		selectedCandidate.override,
 		selectedCandidate.dialAddress), true, nil
+}
+
+// SelectCandidateParametersNoWrap selects from all matching overrides and dial
+// addresses in config order without wrapping candidateNumber.
+func (overrides FrontedMeekDialOverrideSpecs) SelectCandidateParametersNoWrap(
+	frontingProviderID, dialAddress, hostHeader string,
+	candidateNumber int) (*FrontedMeekDialOverrideParameters, bool, error) {
+
+	if candidateNumber < 0 {
+		candidateNumber = 0
+	}
+
+	candidates, err := overrides.matchingCandidates(
+		frontingProviderID,
+		dialAddress,
+		hostHeader)
+	if err != nil {
+		return nil, false, errors.Trace(err)
+	}
+	if len(candidates) == 0 || candidateNumber >= len(candidates) {
+		return nil, false, nil
+	}
+
+	selectedCandidate := candidates[candidateNumber]
+	return makeFrontedMeekDialOverrideParameters(
+		selectedCandidate.override,
+		selectedCandidate.dialAddress), true, nil
+}
+
+func (overrides FrontedMeekDialOverrideSpecs) matchingCandidates(
+	frontingProviderID, dialAddress, hostHeader string) (
+	[]frontedMeekDialOverrideCandidate, error) {
+
+	if len(overrides) == 0 {
+		return nil, nil
+	}
+
+	candidates := make([]frontedMeekDialOverrideCandidate, 0)
+
+	for _, override := range overrides {
+		if override == nil {
+			continue
+		}
+		matches, err := override.matches(frontingProviderID, dialAddress, hostHeader)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		if !matches {
+			continue
+		}
+		if len(override.DialAddresses) == 0 {
+			return nil, errors.TraceNew("missing fronted meek dial override address")
+		}
+		for _, selectedDialAddress := range override.DialAddresses {
+			if selectedDialAddress == "" {
+				return nil, errors.TraceNew("empty fronted meek dial override address")
+			}
+			candidates = append(candidates, frontedMeekDialOverrideCandidate{
+				override:    override,
+				dialAddress: selectedDialAddress,
+			})
+		}
+	}
+
+	return candidates, nil
 }
 
 func makeFrontedMeekDialOverrideParameters(
@@ -316,6 +398,329 @@ func makeFrontedMeekDialOverrideParameters(
 		ALPNProtocols:     copyStrings(override.ALPNProtocols),
 		TLSProfile:        override.TLSProfile,
 	}
+}
+
+// IsEmpty returns whether the scan spec has no IP candidates.
+func (spec FrontedMeekCDNScanSpec) IsEmpty() bool {
+	return len(splitFrontedMeekCDNScanEntries(spec.IPCandidates)) == 0
+}
+
+// Validate checks that scan IP and SNI candidates are well-formed.
+func (spec FrontedMeekCDNScanSpec) Validate() error {
+	_, _, err := spec.normalized()
+	return errors.Trace(err)
+}
+
+// CandidateCount returns the number of IP/SNI candidate pairs. Large spaces
+// are capped at MaxInt32 to keep candidate numbering compatible with int.
+func (spec FrontedMeekCDNScanSpec) CandidateCount() int {
+	ranges, sniServerNames, err := spec.normalized()
+	if err != nil {
+		return 0
+	}
+	count := frontedMeekCDNScanCandidateCount(ranges, sniServerNames)
+	if count > maxFrontedMeekCDNScanCandidates {
+		return int(maxFrontedMeekCDNScanCandidates)
+	}
+	return int(count)
+}
+
+// SNIServerNameCount returns the number of configured SNI server names.
+func (spec FrontedMeekCDNScanSpec) SNIServerNameCount() int {
+	_, sniServerNames, err := spec.normalized()
+	if err != nil {
+		return 0
+	}
+	return len(sniServerNames)
+}
+
+// CacheKey returns a stable digest for the normalized candidate set.
+func (spec FrontedMeekCDNScanSpec) CacheKey() string {
+	ranges, sniServerNames, err := spec.normalized()
+	if err != nil {
+		return ""
+	}
+	hash := sha256.New()
+	for _, ipRange := range ranges {
+		var data [8]byte
+		binary.BigEndian.PutUint32(data[0:4], ipRange.first)
+		binary.BigEndian.PutUint32(data[4:8], ipRange.last)
+		hash.Write(data[:])
+	}
+	hash.Write([]byte{0})
+	for _, sniServerName := range sniServerNames {
+		hash.Write([]byte(strings.ToLower(sniServerName)))
+		hash.Write([]byte{0})
+	}
+	// Empty SNI is an implicit additional variant for every IP candidate.
+	hash.Write([]byte{0})
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+// SelectCandidate selects an IP/SNI candidate in a deterministic shuffled
+// order. skipped contains candidate keys that should be temporarily
+// deprioritized; if all probed candidates are skipped, the selected candidate
+// is returned anyway so establishment can continue.
+func (spec FrontedMeekCDNScanSpec) SelectCandidate(
+	candidateNumber int,
+	skipped map[string]struct{}) (*FrontedMeekCDNScanCandidate, bool, error) {
+
+	return spec.SelectCandidateWithShuffleKey(candidateNumber, skipped, "")
+}
+
+// SelectCandidateWithShuffleKey is equivalent to SelectCandidate, but salts
+// the deterministic shuffle with a caller-supplied key so different clients can
+// scan the same candidate set in different orders.
+func (spec FrontedMeekCDNScanSpec) SelectCandidateWithShuffleKey(
+	candidateNumber int,
+	skipped map[string]struct{},
+	shuffleKey string) (*FrontedMeekCDNScanCandidate, bool, error) {
+
+	ranges, sniServerNames, err := spec.normalized()
+	if err != nil {
+		return nil, false, errors.Trace(err)
+	}
+
+	count := frontedMeekCDNScanCandidateCount(ranges, sniServerNames)
+	if count == 0 {
+		return nil, false, nil
+	}
+	if count > maxFrontedMeekCDNScanCandidates {
+		count = maxFrontedMeekCDNScanCandidates
+	}
+
+	if candidateNumber < 0 {
+		candidateNumber = 0
+	}
+
+	probeLimit := uint64(len(skipped) + 1)
+	if probeLimit > count {
+		probeLimit = count
+	}
+	if probeLimit == 0 {
+		probeLimit = 1
+	}
+
+	var fallback *FrontedMeekCDNScanCandidate
+	for i := uint64(0); i < probeLimit; i++ {
+		index := spec.permutedCandidateIndex(
+			uint64(candidateNumber)+i,
+			count,
+			shuffleKey)
+		candidate := frontedMeekCDNScanCandidateAt(
+			ranges,
+			sniServerNames,
+			index)
+		if fallback == nil {
+			fallback = candidate
+		}
+		if _, ok := skipped[candidate.Key()]; !ok {
+			return candidate, true, nil
+		}
+	}
+
+	return fallback, fallback != nil, nil
+}
+
+// Key returns a stable cache key for the candidate.
+func (candidate FrontedMeekCDNScanCandidate) Key() string {
+	return candidate.IPAddress + "|" + strings.ToLower(candidate.SNIServerName)
+}
+
+func (spec FrontedMeekCDNScanSpec) normalized() (
+	[]frontedMeekCDNScanIPRange, []string, error) {
+
+	ranges := make([]frontedMeekCDNScanIPRange, 0)
+	seenIPCandidates := make(map[string]struct{})
+
+	for _, token := range splitFrontedMeekCDNScanEntries(spec.IPCandidates) {
+		ipRange, canonical, err := parseFrontedMeekCDNScanIPCandidate(token)
+		if err != nil {
+			return nil, nil, errors.Trace(err)
+		}
+		if _, ok := seenIPCandidates[canonical]; ok {
+			continue
+		}
+		seenIPCandidates[canonical] = struct{}{}
+		ranges = append(ranges, ipRange)
+	}
+
+	sniServerNames := make([]string, 0)
+	seenSNIServerNames := make(map[string]struct{})
+	for _, token := range splitFrontedMeekCDNScanEntries(spec.SNIServerNames) {
+		sniServerName := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(token)), ".")
+		if !isValidFrontedMeekCDNScanHostname(sniServerName) {
+			return nil, nil, errors.Tracef(
+				"invalid fronted meek CDN scan SNI server name: %s", token)
+		}
+		if _, ok := seenSNIServerNames[sniServerName]; ok {
+			continue
+		}
+		seenSNIServerNames[sniServerName] = struct{}{}
+		sniServerNames = append(sniServerNames, sniServerName)
+	}
+
+	return ranges, sniServerNames, nil
+}
+
+func splitFrontedMeekCDNScanEntries(values []string) []string {
+	entries := make([]string, 0)
+	for _, value := range values {
+		for _, token := range strings.FieldsFunc(value, func(r rune) bool {
+			return r == ',' || r == ';' || r == '\n' || r == '\r' || r == '\t' || r == ' '
+		}) {
+			token = strings.TrimSpace(token)
+			if token != "" {
+				entries = append(entries, token)
+			}
+		}
+	}
+	return entries
+}
+
+func parseFrontedMeekCDNScanIPCandidate(token string) (
+	frontedMeekCDNScanIPRange, string, error) {
+
+	if strings.Contains(token, "/") {
+		ip, network, err := net.ParseCIDR(token)
+		if err != nil {
+			return frontedMeekCDNScanIPRange{}, "", errors.Trace(err)
+		}
+		ipv4 := ip.To4()
+		networkIPv4 := network.IP.To4()
+		ones, bits := network.Mask.Size()
+		if ipv4 == nil || networkIPv4 == nil || bits != 32 {
+			return frontedMeekCDNScanIPRange{}, "", errors.Tracef(
+				"invalid fronted meek CDN scan IPv4 CIDR: %s", token)
+		}
+		size := uint64(1) << uint(bits-ones)
+		first := binary.BigEndian.Uint32(networkIPv4)
+		last := first + uint32(size-1)
+		return frontedMeekCDNScanIPRange{first: first, last: last}, network.String(), nil
+	}
+
+	ip := net.ParseIP(token)
+	if ip == nil || ip.To4() == nil {
+		return frontedMeekCDNScanIPRange{}, "", errors.Tracef(
+			"invalid fronted meek CDN scan IPv4 address: %s", token)
+	}
+	ipValue := binary.BigEndian.Uint32(ip.To4())
+	canonical := net.IPv4(ip.To4()[0], ip.To4()[1], ip.To4()[2], ip.To4()[3]).String()
+	return frontedMeekCDNScanIPRange{first: ipValue, last: ipValue}, canonical, nil
+}
+
+func frontedMeekCDNScanIPRangeCount(ranges []frontedMeekCDNScanIPRange) uint64 {
+	var count uint64
+	for _, ipRange := range ranges {
+		count += uint64(ipRange.last-ipRange.first) + 1
+		if count > maxFrontedMeekCDNScanCandidates {
+			return maxFrontedMeekCDNScanCandidates
+		}
+	}
+	return count
+}
+
+func frontedMeekCDNScanCandidateCount(
+	ranges []frontedMeekCDNScanIPRange,
+	sniServerNames []string) uint64 {
+
+	ipCount := frontedMeekCDNScanIPRangeCount(ranges)
+	if ipCount == 0 {
+		return 0
+	}
+
+	sniVariantCount := uint64(len(sniServerNames)) + 1
+	if ipCount > maxFrontedMeekCDNScanCandidates/sniVariantCount {
+		return maxFrontedMeekCDNScanCandidates
+	}
+
+	return ipCount * sniVariantCount
+}
+
+func (spec FrontedMeekCDNScanSpec) permutedCandidateIndex(
+	candidateNumber, count uint64,
+	shuffleKey string) uint64 {
+
+	cacheKey := spec.CacheKey()
+	seed := sha256.Sum256([]byte(
+		"fronted-meek-cdn-scan|" + cacheKey + "|" + shuffleKey))
+	offset := binary.BigEndian.Uint64(seed[0:8]) % count
+	step := binary.BigEndian.Uint64(seed[8:16]) % count
+	if step == 0 {
+		step = 1
+	}
+	for gcdUint64(step, count) != 1 {
+		step++
+		if step >= count {
+			step = 1
+		}
+	}
+	return (offset + (candidateNumber%count)*step) % count
+}
+
+func frontedMeekCDNScanCandidateAt(
+	ranges []frontedMeekCDNScanIPRange,
+	sniServerNames []string,
+	index uint64) *FrontedMeekCDNScanCandidate {
+
+	sniCount := uint64(len(sniServerNames)) + 1
+	ipIndex := index / sniCount
+	sniIndex := index % sniCount
+
+	for _, ipRange := range ranges {
+		rangeSize := uint64(ipRange.last-ipRange.first) + 1
+		if ipIndex >= rangeSize {
+			ipIndex -= rangeSize
+			continue
+		}
+		ipValue := ipRange.first + uint32(ipIndex)
+		ipAddress := net.IPv4(
+			byte(ipValue>>24),
+			byte(ipValue>>16),
+			byte(ipValue>>8),
+			byte(ipValue)).String()
+		sniServerName := ""
+		if sniIndex < uint64(len(sniServerNames)) {
+			sniServerName = sniServerNames[sniIndex]
+		}
+		return &FrontedMeekCDNScanCandidate{
+			IPAddress:     ipAddress,
+			SNIServerName: sniServerName,
+		}
+	}
+
+	return nil
+}
+
+func isValidFrontedMeekCDNScanHostname(hostname string) bool {
+	if hostname == "" || len(hostname) > 253 || net.ParseIP(hostname) != nil {
+		return false
+	}
+	labels := strings.Split(hostname, ".")
+	for _, label := range labels {
+		if label == "" || len(label) > 63 ||
+			strings.HasPrefix(label, "-") ||
+			strings.HasSuffix(label, "-") {
+			return false
+		}
+		for _, r := range label {
+			if (r >= 'a' && r <= 'z') ||
+				(r >= 'A' && r <= 'Z') ||
+				(r >= '0' && r <= '9') ||
+				r == '-' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
+}
+
+func gcdUint64(a, b uint64) uint64 {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
 }
 
 // Validate checks that the JSON values are well-formed.

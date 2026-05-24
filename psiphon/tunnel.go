@@ -43,7 +43,6 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/fragmentor"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/inproxy"
-	inproxy_dtls "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/inproxy/dtls"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/obfuscator"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/parameters"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
@@ -99,12 +98,15 @@ type Tunnel struct {
 	serverContext                  *ServerContext
 	monitoringStartTime            time.Time
 	conn                           *common.BurstMonitoredConn
+	activityConn                   *common.ActivityMonitoredConn
 	sshClient                      *ssh.Client
 	sshServerRequests              <-chan *ssh.Request
 	operateWaitGroup               *sync.WaitGroup
 	operateCtx                     context.Context
 	stopOperate                    context.CancelFunc
 	signalPortForwardFailure       chan struct{}
+	signalSSHRequestFailure        chan error
+	signalAppResumed               chan struct{}
 	totalPortForwardFailures       int
 	adjustedEstablishStartTime     time.Time
 	establishDuration              time.Duration
@@ -167,13 +169,33 @@ func ConnectTunnel(
 		extraFailureAction:  dialResult.extraFailureAction,
 		monitoringStartTime: dialResult.monitoringStartTime,
 		conn:                dialResult.monitoredConn,
+		activityConn:        dialResult.activityConn,
 		sshClient:           dialResult.sshClient,
 		sshServerRequests:   dialResult.sshRequests,
 		// A buffer allows at least one signal to be sent even when the receiver is
 		// not listening. Senders should not block.
 		signalPortForwardFailure:   make(chan struct{}, 1),
+		signalSSHRequestFailure:    make(chan error, 1),
+		signalAppResumed:           make(chan struct{}, 1),
 		adjustedEstablishStartTime: adjustedEstablishStartTime,
 	}, nil
+}
+
+// AppResumed notifies the tunnel that the host app has resumed from
+// background and that tunnel liveness may need to be re-evaluated.
+//
+// In cases such as device sleep or app process freezing while a tunnel is
+// connected, after resuming the tunnel may be dead. AppResumed triggers dead
+// tunnel detection that is more aggressive than the standard port forward
+// timeout plus SSH keep alive probe sequence: depending on the elapsed time
+// since the last read from the tunnel, tunnel establishment may be triggered
+// immediately, or a keep alive probe sent immediately without awaiting a
+// port forward timeout.
+func (tunnel *Tunnel) AppResumed() {
+	select {
+	case tunnel.signalAppResumed <- struct{}{}:
+	default:
+	}
 }
 
 // Activate completes the tunnel establishment, performing the handshake
@@ -542,6 +564,10 @@ func (tunnel *Tunnel) IsDiscarded() bool {
 	return tunnel.isDiscarded
 }
 
+func (tunnel *Tunnel) GetReadInactiveDuration() time.Duration {
+	return tunnel.activityConn.GetReadInactiveDuration()
+}
+
 // SendAPIRequest sends an API request as an SSH request through the tunnel.
 // This function blocks awaiting a response. Only one request may be in-flight
 // at once; a concurrent SendAPIRequest will block until an active request
@@ -553,7 +579,12 @@ func (tunnel *Tunnel) SendAPIRequest(
 		name, true, requestPayload)
 
 	if err != nil {
-		return nil, errors.Trace(err)
+		err = errors.Trace(err)
+		select {
+		case tunnel.signalSSHRequestFailure <- err:
+		default:
+		}
+		return nil, err
 	}
 
 	if !ok {
@@ -782,6 +813,7 @@ type dialResult struct {
 	dialConn            net.Conn
 	monitoringStartTime time.Time
 	monitoredConn       *common.BurstMonitoredConn
+	activityConn        *common.ActivityMonitoredConn
 	sshClient           *ssh.Client
 	sshRequests         <-chan *ssh.Request
 	livenessTestMetrics *livenessTestMetrics
@@ -819,6 +851,8 @@ func dialTunnel(
 	conjureEnableIPv6Dials := p.Bool(parameters.ConjureEnableIPv6Dials)
 	conjureEnablePortRandomization := p.Bool(parameters.ConjureEnablePortRandomization)
 	conjureEnableRegistrationOverrides := p.Bool(parameters.ConjureEnableRegistrationOverrides)
+	sshChannelWindowSize := p.Int(parameters.SSHChannelWindowSize)
+	sshPacketTunnelChannelWindowSize := p.Int(parameters.SSHPacketTunnelChannelWindowSize)
 	p.Close()
 
 	// Ensure that, unless the base context is cancelled, any replayed dial
@@ -1040,9 +1074,18 @@ func dialTunnel(
 		}
 	}()
 
+	activityConn, err := common.NewActivityMonitoredConn(
+		dialConn,
+		0,
+		false,
+		nil)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
 	monitoringStartTime := time.Now()
 	monitoredConn := common.NewBurstMonitoredConn(
-		dialConn,
+		activityConn,
 		false,
 		burstUpstreamTargetBytes, burstUpstreamDeadline,
 		burstDownstreamTargetBytes, burstDownstreamDeadline)
@@ -1123,6 +1166,8 @@ func dialTunnel(
 	}
 
 	sshClientConfig.KEXPRNGSeed = dialParams.SSHKEXSeed
+	sshClientConfig.ChannelWindowSize = sshChannelWindowSize
+	sshClientConfig.PacketTunnelChannelWindowSize = sshPacketTunnelChannelWindowSize
 
 	if protocol.TunnelProtocolUsesObfuscatedSSH(dialParams.TunnelProtocol) {
 		if config.ObfuscatedSSHAlgorithms != nil {
@@ -1298,6 +1343,7 @@ func dialTunnel(
 			dialConn:            dialConn,
 			monitoringStartTime: monitoringStartTime,
 			monitoredConn:       monitoredConn,
+			activityConn:        activityConn,
 			sshClient:           result.sshClient,
 			sshRequests:         result.sshRequests,
 			livenessTestMetrics: result.livenessTestMetrics,
@@ -1441,16 +1487,8 @@ func dialConjure(
 		refraction.DeleteCachedConjureRegistration(conjureConfig)
 	}
 
-	dialCtx := ctx
-	if protocol.ConjureTransportUsesDTLS(dialParams.ConjureTransport) {
-		// Conjure doesn't use the DTLS seed scheme, which supports in-proxy
-		// DTLS randomization. But every DTLS dial expects to find a seed
-		// state, so set the no-seed state.
-		dialCtx = inproxy_dtls.SetNoDTLSSeed(ctx)
-	}
-
 	dialConn, err := refraction.DialConjure(
-		dialCtx,
+		ctx,
 		config.EmitRefractionNetworkingLogs,
 		config.GetPsiphonDataDirectory(),
 		NewRefractionNetworkingDialer(dialParams.GetDialConfig()).DialContext,
@@ -1845,7 +1883,6 @@ func (tunnel *Tunnel) operateTunnel(tunnelOwner TunnelOwner) {
 	defer tunnel.operateWaitGroup.Done()
 
 	now := time.Now()
-	lastBytesReceivedTime := now
 	lastTotalBytesTransferedTime := now
 	totalSent := int64(0)
 	totalReceived := int64(0)
@@ -1965,6 +2002,57 @@ func (tunnel *Tunnel) operateTunnel(tunnelOwner TunnelOwner) {
 		}
 	}()
 
+	enqueueProbe := func(isAppResumed bool) error {
+
+		inactive := tunnel.activityConn.GetReadInactiveDuration()
+
+		var inactiveThreshold, probeTimeout time.Duration
+		p := tunnel.getCustomParameters()
+
+		if isAppResumed {
+
+			// In the AppResumed case, if the last tunnel read was sufficiently
+			// long ago, skip the probe and initiate a full tunnel
+			// establishment. The server side will have closed any tunnel
+			// that's been idle for too long.
+			reconnectInactiveThreshold := p.Duration(
+				parameters.SSHKeepAliveResumeReconnectInactivePeriod)
+			if inactive >= reconnectInactiveThreshold {
+				NoticeInfo("AppResumed: trigger reconnect")
+				return errors.Tracef(
+					"read inactive threshold exceeded: %v >= %v",
+					inactive, reconnectInactiveThreshold)
+			}
+
+			inactiveThreshold = p.Duration(parameters.SSHKeepAliveResumeProbeInactivePeriod)
+			probeTimeout = p.Duration(parameters.SSHKeepAliveResumeProbeTimeout)
+
+			if inactive >= inactiveThreshold {
+				NoticeInfo("AppResumed: trigger SSH keep alive probe")
+			} else {
+				NoticeInfo("AppResumed: skip SSH keep alive probe")
+			}
+
+		} else {
+			inactiveThreshold = p.Duration(parameters.SSHKeepAliveProbeInactivePeriod)
+			probeTimeout = p.Duration(parameters.SSHKeepAliveProbeTimeout)
+		}
+
+		if inactive >= inactiveThreshold {
+			select {
+			case signalProbeSshKeepAlive <- probeTimeout:
+			default:
+			}
+
+			// Push out the next scheduled periodic keep alive.
+			if !tunnel.config.DisablePeriodicSshKeepAlive {
+				sshKeepAliveTimer.Reset(nextSshKeepAlivePeriod())
+			}
+		}
+
+		return nil
+	}
+
 	shutdown := false
 	var err error
 	for !shutdown && err == nil {
@@ -1972,10 +2060,6 @@ func (tunnel *Tunnel) operateTunnel(tunnelOwner TunnelOwner) {
 		case <-noticeBytesTransferredTicker.C:
 			sent, received := transferstats.ReportRecentBytesTransferredForServer(
 				tunnel.dialParams.ServerEntry.IpAddress)
-
-			if received > 0 {
-				lastBytesReceivedTime = time.Now()
-			}
 
 			bytesUp := atomic.AddInt64(&totalSent, sent)
 			bytesDown := atomic.AddInt64(&totalReceived, received)
@@ -2031,8 +2115,8 @@ func (tunnel *Tunnel) operateTunnel(tunnelOwner TunnelOwner) {
 
 		case <-sshKeepAliveTimer.C:
 			p := tunnel.getCustomParameters()
-			inactivePeriod := p.Duration(parameters.SSHKeepAlivePeriodicInactivePeriod)
-			if lastBytesReceivedTime.Add(inactivePeriod).Before(time.Now()) {
+			inactiveThreshold := p.Duration(parameters.SSHKeepAlivePeriodicInactivePeriod)
+			if tunnel.activityConn.GetReadInactiveDuration() >= inactiveThreshold {
 				timeout := p.Duration(parameters.SSHKeepAlivePeriodicTimeout)
 				select {
 				case signalPeriodicSshKeepAlive <- timeout:
@@ -2059,19 +2143,33 @@ func (tunnel *Tunnel) operateTunnel(tunnelOwner TunnelOwner) {
 			if tunnel.conn.IsClosed() {
 				err = errors.TraceNew("underlying conn is closed")
 			} else {
-				p := tunnel.getCustomParameters()
-				inactivePeriod := p.Duration(parameters.SSHKeepAliveProbeInactivePeriod)
-				if lastBytesReceivedTime.Add(inactivePeriod).Before(time.Now()) {
-					timeout := p.Duration(parameters.SSHKeepAliveProbeTimeout)
-					select {
-					case signalProbeSshKeepAlive <- timeout:
-					default:
-					}
-				}
-				if !tunnel.config.DisablePeriodicSshKeepAlive {
-					sshKeepAliveTimer.Reset(nextSshKeepAlivePeriod())
-				}
+				err = enqueueProbe(false)
+			}
 
+		case <-tunnel.signalAppResumed:
+
+			if tunnel.conn.IsClosed() {
+				err = errors.TraceNew("underlying conn is closed")
+			} else {
+				err = enqueueProbe(true)
+			}
+
+		case requestErr := <-tunnel.signalSSHRequestFailure:
+
+			if tunnel.conn.IsClosed() {
+				err = errors.TraceNew("underlying conn is closed")
+			} else if std_errors.Is(requestErr, io.EOF) {
+
+				// ssh.Conn.SendRequest returns EOF only after the ssh.mux has
+				// shut down and closed its response channel, which implies
+				// the tunnel is closed or closing.
+				err = requestErr
+
+			} else {
+
+				// Trigger a probe to check if the SSH request failure is due
+				// to a dead tunnel.
+				err = enqueueProbe(false)
 			}
 
 		case err = <-sshKeepAliveError:

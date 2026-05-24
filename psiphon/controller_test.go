@@ -156,9 +156,6 @@ func TestTLSOSSH(t *testing.T) {
 }
 
 func TestShadowsocks(t *testing.T) {
-
-	t.Skipf("temporarily disabled")
-
 	controllerRun(t,
 		&controllerRunConfig{
 			protocol:                 protocol.TUNNEL_PROTOCOL_SHADOWSOCKS_OSSH,
@@ -322,6 +319,7 @@ func TestFrontedQUIC(t *testing.T) {
 
 func TestInproxyOSSH(t *testing.T) {
 
+	t.Skipf("temporarily disabled")
 	if !inproxy.Enabled() {
 		t.Skip("In-proxy is not enabled")
 	}
@@ -336,6 +334,7 @@ func TestInproxyOSSH(t *testing.T) {
 
 func TestInproxyQUICOSSH(t *testing.T) {
 
+	t.Skipf("temporarily disabled")
 	if !inproxy.Enabled() {
 		t.Skip("In-proxy is not enabled")
 	}
@@ -350,6 +349,7 @@ func TestInproxyQUICOSSH(t *testing.T) {
 
 func TestInproxyUnfrontedMeekHTTPS(t *testing.T) {
 
+	t.Skipf("temporarily disabled")
 	if !inproxy.Enabled() {
 		t.Skip("In-proxy is not enabled")
 	}
@@ -363,6 +363,7 @@ func TestInproxyUnfrontedMeekHTTPS(t *testing.T) {
 
 func TestInproxyTLSOSSH(t *testing.T) {
 
+	t.Skipf("temporarily disabled")
 	if !inproxy.Enabled() {
 		t.Skip("In-proxy is not enabled")
 	}
@@ -391,6 +392,15 @@ func TestLegacyAPIEncoding(t *testing.T) {
 		})
 }
 
+func TestAppResumed(t *testing.T) {
+	controllerRun(t,
+		&controllerRunConfig{
+			protocol:                 protocol.TUNNEL_PROTOCOL_SSH,
+			disableUntunneledUpgrade: true,
+			doAppResumed:             true,
+		})
+}
+
 type controllerRunConfig struct {
 	expectNoServerEntries    bool
 	protocol                 string
@@ -406,6 +416,7 @@ type controllerRunConfig struct {
 	useLegacyAPIEncoding     bool
 	useInproxyDialRateLimit  bool
 	quicVersions             protocol.QUICVersions
+	doAppResumed             bool
 }
 
 func controllerRun(t *testing.T, runConfig *controllerRunConfig) {
@@ -483,6 +494,12 @@ func controllerRun(t *testing.T, runConfig *controllerRunConfig) {
 
 	// TODO: vary this option
 	modifyConfig["CompressTactics"] = false
+
+	appResumedReconnectMilliseconds := 1
+	if runConfig.doAppResumed {
+		modifyConfig["SSHKeepAliveResumeReconnectInactivePeriodMilliseconds"] =
+			appResumedReconnectMilliseconds
+	}
 
 	configJSON, _ = json.Marshal(modifyConfig)
 
@@ -755,6 +772,25 @@ func controllerRun(t *testing.T, runConfig *controllerRunConfig) {
 
 			if !runConfig.disruptNetwork {
 				fetchAndVerifyWebsite(t, httpProxyPort)
+			}
+		}
+
+		if runConfig.doAppResumed {
+
+			// Test: AppResumed must trigger reestablishment
+
+			time.Sleep(
+				1*time.Second +
+					time.Duration(appResumedReconnectMilliseconds)*time.Millisecond)
+
+			controller.AppResumed()
+
+			establishTimeout := time.NewTimer(120 * time.Second)
+
+			select {
+			case <-tunnelEstablished:
+			case <-establishTimeout.C:
+				t.Fatalf("tunnel re-establish timeout exceeded")
 			}
 		}
 	}

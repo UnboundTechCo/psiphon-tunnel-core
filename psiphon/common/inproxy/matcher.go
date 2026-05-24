@@ -22,7 +22,7 @@ import (
 	"container/list"
 	"context"
 	std_errors "errors"
-	"net"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,8 +39,13 @@ const (
 	matcherOfferQueueMaxSize        = 5000000
 	matcherPendingAnswersTTL        = 30 * time.Second
 	matcherPendingAnswersMaxSize    = 5000000
-	matcherMaxPreferredNATProbe     = 100
-	matcherMaxProbe                 = 1000
+	matcherMaxPreferredNATProbe     = 10
+	matcherMaxProbe                 = 100
+	matcherYieldCount               = 32
+
+	matcherMaxRateLimitQuantity = 10000
+	matcherMaxRateLimitInterval = 1 * time.Minute
+	matcherMaxLimitEntryCount   = 10000
 )
 
 // Matcher matches proxy announcements with client offers. Matcher also
@@ -89,7 +94,8 @@ type Matcher struct {
 	announcementLimitEntryCount     int
 	announcementRateLimitQuantity   int
 	announcementRateLimitInterval   time.Duration
-	announcementNonlimitedProxyIDs  map[ID]struct{}
+	announcementExemptProxyIDs      map[ID]struct{}
+	announcementExemptSponsorIDs    common.StringLookup
 
 	// The offer queue is also implicitly sorted by offer age. Both an offer
 	// and announcement queue are required since either announcements or
@@ -102,6 +108,9 @@ type Matcher struct {
 	offerLimitEntryCount     int
 	offerRateLimitQuantity   int
 	offerRateLimitInterval   time.Duration
+	offerMinimumDeadline     time.Duration
+
+	offerQueueLen atomic.Int64
 
 	matchSignal chan struct{}
 
@@ -115,15 +124,17 @@ type MatcherConfig struct {
 	Logger common.Logger
 
 	// Announcement queue limits.
-	AnnouncementLimitEntryCount    int
-	AnnouncementRateLimitQuantity  int
-	AnnouncementRateLimitInterval  time.Duration
-	AnnouncementNonlimitedProxyIDs []ID
+	AnnouncementLimitEntryCount   int
+	AnnouncementRateLimitQuantity int
+	AnnouncementRateLimitInterval time.Duration
+	AnnouncementExemptProxyIDs    []ID
+	AnnouncementExemptSponsorIDs  []string
 
 	// Offer queue limits.
 	OfferLimitEntryCount   int
 	OfferRateLimitQuantity int
 	OfferRateLimitInterval time.Duration
+	OfferMinimumDeadline   time.Duration
 
 	// Proxy quality state.
 	ProxyQualityState *ProxyQualityState
@@ -191,6 +202,7 @@ func (p *MatchProperties) IsPreferredNATMatch(
 type MatchAnnouncement struct {
 	Properties   MatchProperties
 	ProxyID      ID
+	SponsorID    string
 	ProxyMetrics *ProxyMetrics
 	ConnectionID ID
 }
@@ -220,11 +232,13 @@ type MatchAnswer struct {
 // MatchMetrics records statistics about the match queue state at the time a
 // match is made.
 type MatchMetrics struct {
+	OfferDeadline          time.Duration
 	OfferMatchIndex        int
 	OfferQueueSize         int
 	AnnouncementMatchIndex int
 	AnnouncementQueueSize  int
 	PendingAnswersSize     int
+	MatchDuration          time.Duration
 }
 
 // GetMetrics converts MatchMetrics to loggable fields.
@@ -232,12 +246,19 @@ func (metrics *MatchMetrics) GetMetrics() common.LogFields {
 	if metrics == nil {
 		return nil
 	}
+
+	// match_duration, the time between matchAllOffers starting and a match
+	// being made, is reported in microseconds. The common millisecond
+	// duration resolution is expected to be too coarse.
+
 	return common.LogFields{
+		"offer_deadline":           int64(metrics.OfferDeadline / time.Millisecond),
 		"offer_match_index":        metrics.OfferMatchIndex,
 		"offer_queue_size":         metrics.OfferQueueSize,
 		"announcement_match_index": metrics.AnnouncementMatchIndex,
 		"announcement_queue_size":  metrics.AnnouncementQueueSize,
 		"pending_answers_size":     metrics.PendingAnswersSize,
+		"match_duration":           int64(metrics.MatchDuration / time.Microsecond),
 	}
 }
 
@@ -283,6 +304,11 @@ func (offerEntry *offerEntry) getMatchMetrics() *MatchMetrics {
 type answerInfo struct {
 	announcement *MatchAnnouncement
 	answer       *MatchAnswer
+
+	// offerDropped is sent to Offer's answer channel when the offer has been
+	// dropped by the matcher due to age. This allows Offer to return
+	// immediately on drop and the request handler to log this outcome.
+	offerDropped bool
 }
 
 // pendingAnswer represents an answer that is expected to arrive from a
@@ -330,44 +356,79 @@ func NewMatcher(config *MatcherConfig) *Matcher {
 		config.AnnouncementLimitEntryCount,
 		config.AnnouncementRateLimitQuantity,
 		config.AnnouncementRateLimitInterval,
-		config.AnnouncementNonlimitedProxyIDs,
+		config.AnnouncementExemptProxyIDs,
+		config.AnnouncementExemptSponsorIDs,
 		config.OfferLimitEntryCount,
 		config.OfferRateLimitQuantity,
-		config.OfferRateLimitInterval)
+		config.OfferRateLimitInterval,
+		config.OfferMinimumDeadline)
 
 	return m
 }
 
 // SetLimits sets new queue limits, replacing the previous configuration.
-// Existing, cached rate limiters retain their existing rate limit state. New
-// entries will use the new quantity/interval configuration. In addition,
-// currently enqueued items may exceed any new, lower maximum entry count
-// until naturally dequeued.
+// Existing, cached rate limiters retain their existing rate limit state
+// (excepting exempt status changes). New entries will use the new
+// quantity/interval configuration. In addition, currently enqueued items may
+// exceed any new, lower maximum entry count until naturally dequeued.
+// Limit values are capped at sanity check levels.
 func (m *Matcher) SetLimits(
 	announcementLimitEntryCount int,
 	announcementRateLimitQuantity int,
 	announcementRateLimitInterval time.Duration,
-	announcementNonlimitedProxyIDs []ID,
+	announcementExemptProxyIDs []ID,
+	announcementExemptSponsorIDs []string,
 	offerLimitEntryCount int,
 	offerRateLimitQuantity int,
-	offerRateLimitInterval time.Duration) {
+	offerRateLimitInterval time.Duration,
+	offerMinimumDeadline time.Duration) {
 
-	nonlimitedProxyIDs := make(map[ID]struct{})
-	for _, proxyID := range announcementNonlimitedProxyIDs {
-		nonlimitedProxyIDs[proxyID] = struct{}{}
+	exemptProxyIDs := make(map[ID]struct{})
+	for _, proxyID := range announcementExemptProxyIDs {
+		exemptProxyIDs[proxyID] = struct{}{}
+	}
+
+	// Cap at sanity check levels. Explicit limit-disabled (zero value)
+	// configurations are still allowed.
+	//
+	// Limitation: rate limit comparison ignores burstiness.
+
+	if announcementLimitEntryCount > matcherMaxLimitEntryCount {
+		announcementLimitEntryCount = matcherMaxLimitEntryCount
+	}
+	if announcementRateLimitQuantity > 0 && announcementRateLimitInterval > 0 &&
+		(int64(announcementRateLimitQuantity) > math.MaxInt64/int64(matcherMaxRateLimitInterval) ||
+			// Equivalent to quantity/interval > sanityQuantity/sanityInterval
+			int64(announcementRateLimitQuantity)*int64(matcherMaxRateLimitInterval) >
+				int64(matcherMaxRateLimitQuantity)*int64(announcementRateLimitInterval)) {
+		announcementRateLimitQuantity = matcherMaxRateLimitQuantity
+		announcementRateLimitInterval = matcherMaxRateLimitInterval
+	}
+	if offerLimitEntryCount > matcherMaxLimitEntryCount {
+		offerLimitEntryCount = matcherMaxLimitEntryCount
+	}
+	if offerRateLimitQuantity > 0 && offerRateLimitInterval > 0 &&
+		(int64(offerRateLimitQuantity) > math.MaxInt64/int64(matcherMaxRateLimitInterval) ||
+			int64(offerRateLimitQuantity)*int64(matcherMaxRateLimitInterval) >
+				int64(matcherMaxRateLimitQuantity)*int64(offerRateLimitInterval)) {
+		offerRateLimitQuantity = matcherMaxRateLimitQuantity
+		offerRateLimitInterval = matcherMaxRateLimitInterval
 	}
 
 	m.announcementQueueMutex.Lock()
 	m.announcementLimitEntryCount = announcementLimitEntryCount
 	m.announcementRateLimitQuantity = announcementRateLimitQuantity
 	m.announcementRateLimitInterval = announcementRateLimitInterval
-	m.announcementNonlimitedProxyIDs = nonlimitedProxyIDs
+	m.announcementExemptProxyIDs = exemptProxyIDs
+	m.announcementExemptSponsorIDs = common.NewStringLookup(
+		announcementExemptSponsorIDs)
 	m.announcementQueueMutex.Unlock()
 
 	m.offerQueueMutex.Lock()
 	m.offerLimitEntryCount = offerLimitEntryCount
 	m.offerRateLimitQuantity = offerRateLimitQuantity
 	m.offerRateLimitInterval = offerRateLimitInterval
+	m.offerMinimumDeadline = offerMinimumDeadline
 	m.offerQueueMutex.Unlock()
 }
 
@@ -448,7 +509,7 @@ func (m *Matcher) Announce(
 
 	announcementEntry := &announcementEntry{
 		ctx:          ctx,
-		limitIP:      getRateLimitIP(proxyIP),
+		limitIP:      common.GetRateLimitIP(proxyIP),
 		announcement: proxyAnnouncement,
 		offerChan:    make(chan *MatchOffer, 1),
 	}
@@ -472,6 +533,8 @@ func (m *Matcher) Announce(
 
 	return clientOffer, announcementEntry.getMatchMetrics(), nil
 }
+
+var errOfferDropped = std_errors.New("offer dropped")
 
 // Offer enqueues the client offer and blocks until it is matched with a
 // returned announcement or ctx is done. The caller must not mutate the offer
@@ -508,7 +571,7 @@ func (m *Matcher) Offer(
 
 	offerEntry := &offerEntry{
 		ctx:        ctx,
-		limitIP:    getRateLimitIP(clientIP),
+		limitIP:    common.GetRateLimitIP(clientIP),
 		offer:      clientOffer,
 		answerChan: make(chan *answerInfo, 1),
 	}
@@ -546,6 +609,11 @@ func (m *Matcher) Offer(
 			offerEntry.getMatchMetrics(), errors.TraceNew("no answer")
 	}
 
+	if proxyAnswerInfo.offerDropped {
+		return nil, nil,
+			offerEntry.getMatchMetrics(), errOfferDropped
+	}
+
 	// This is a sanity check and not expected to fail.
 	if !proxyAnswerInfo.answer.ConnectionID.Equal(
 		proxyAnswerInfo.announcement.ConnectionID) {
@@ -558,6 +626,8 @@ func (m *Matcher) Offer(
 		offerEntry.getMatchMetrics(),
 		nil
 }
+
+var errNoPendingAnswer = std_errors.New("no pending answer")
 
 // AnnouncementHasPersonalCompartmentIDs looks for a pending answer for an
 // announcement identified by the specified proxy ID and connection ID and
@@ -573,7 +643,7 @@ func (m *Matcher) AnnouncementHasPersonalCompartmentIDs(
 	if !ok {
 		// The input IDs don't correspond to a pending answer, or the client
 		// is no longer awaiting the response.
-		return false, errors.TraceNew("no pending answer")
+		return false, errors.Trace(errNoPendingAnswer)
 	}
 
 	pendingAnswer := pendingAnswerValue.(*pendingAnswer)
@@ -599,7 +669,7 @@ func (m *Matcher) Answer(
 	if !ok {
 		// The input IDs don't correspond to a pending answer, or the client
 		// is no longer awaiting the response.
-		return errors.TraceNew("no pending answer")
+		return errors.Trace(errNoPendingAnswer)
 	}
 
 	m.pendingAnswers.Delete(key)
@@ -651,17 +721,18 @@ func (m *Matcher) matchWorker(ctx context.Context) {
 // matchAllOffers iterates over the queues, making all possible matches.
 func (m *Matcher) matchAllOffers() {
 
-	m.announcementQueueMutex.Lock()
-	defer m.announcementQueueMutex.Unlock()
+	// Include lock acquisition time in MatchDuration metric.
+	startTime := time.Now()
+
 	m.offerQueueMutex.Lock()
 	defer m.offerQueueMutex.Unlock()
+
+	m.announcementQueueMutex.Lock()
+	defer m.announcementQueueMutex.Unlock()
 
 	// Take each offer in turn, and select an announcement match. There is an
 	// implicit preference for older client offers, sooner to timeout, at the
 	// front of the queue.
-
-	// TODO: consider matching one offer, then releasing the locks to allow
-	// more announcements to be enqueued, then continuing to match.
 
 	nextOffer := m.offerQueue.Front()
 	offerIndex := -1
@@ -670,6 +741,13 @@ func (m *Matcher) matchAllOffers() {
 
 		offerIndex += 1
 
+		// Periodicially yield the announcement queue lock to allow proxy
+		// announces a chance to enqueue.
+		if offerIndex > 0 && offerIndex%matcherYieldCount == 0 {
+			m.announcementQueueMutex.Unlock()
+			m.announcementQueueMutex.Lock()
+		}
+
 		// nextOffer.Next must be invoked before any removeOfferEntry since
 		// container/list.remove clears list.Element.next.
 		offer := nextOffer
@@ -677,12 +755,27 @@ func (m *Matcher) matchAllOffers() {
 
 		offerEntry := offer.Value.(*offerEntry)
 
-		// Skip and remove this offer if its deadline has already passed.
-		// There is no signal to the awaiting Offer function, as it will exit
-		// based on the same ctx.
+		// Skip and remove this offer if its deadline has already passed or
+		// the context is canceled. There is no signal to the awaiting Offer
+		// function, as it will exit based on the same ctx.
 
 		if offerEntry.ctx.Err() != nil {
 			m.removeOfferEntry(false, offerEntry)
+			continue
+		}
+
+		offerDeadline, _ := offerEntry.ctx.Deadline()
+		untilOfferDeadline := time.Until(offerDeadline)
+
+		// Drop this offer if it no longer has a sufficient remaining deadline
+		// for the proxy answer phase. This case signals Offer's answerChan
+		// so it can return immediately.
+
+		if m.offerMinimumDeadline > 0 &&
+			untilOfferDeadline < m.offerMinimumDeadline {
+
+			m.removeOfferEntry(false, offerEntry)
+			offerEntry.answerChan <- &answerInfo{offerDropped: true}
 			continue
 		}
 
@@ -696,13 +789,21 @@ func (m *Matcher) matchAllOffers() {
 		// The index metrics predate the announcement multi-queue; now, with
 		// the multi-queue, announcement_index is how many announce entries
 		// were inspected before matching.
+		//
+		// MatchDuration is intended to capture a sample of matchAllOffer
+		// processing time without resorting to new log events.
+		// Limitation: MatchDuration does not fully represent matchAllOffer
+		// elapsed time since it doesn't include passes with no matches or
+		// time spent failing to match after the last match in the pass.
 
 		matchMetrics := &MatchMetrics{
+			OfferDeadline:          untilOfferDeadline,
 			OfferMatchIndex:        offerIndex,
 			OfferQueueSize:         m.offerQueue.Len(),
 			AnnouncementMatchIndex: announcementMatchIndex,
 			AnnouncementQueueSize:  m.announcementQueue.getLen(),
 			PendingAnswersSize:     m.pendingAnswers.ItemCount(),
+			MatchDuration:          time.Since(startTime),
 		}
 
 		offerEntry.matchMetrics.Store(matchMetrics)
@@ -877,6 +978,12 @@ func (m *Matcher) matchOffer(offerEntry *offerEntry) (*announcementEntry, int) {
 			}
 		}
 
+		// Currently, there is no check or preference that the offer and
+		// announce have at least one of hasIPv4 or hasIPv6 in common, as
+		// clients are allowed to offer with no candidates and IPv6
+		// transition mechanisms such as 4in6/6in4/464XLAT/Teredo/etc. may be
+		// available.
+
 		// Check if this is a preferred NAT match. Ultimately, a match may be
 		// made with potentially incompatible NATs, but the client/proxy
 		// reported NAT types may be incorrect or unknown; the client will
@@ -945,16 +1052,11 @@ func (m *Matcher) applyLoadLimit(isAnnouncement bool) error {
 		return nil
 	}
 
-	// Acquire the queue locks only when in the load limit state, and in the
-	// same order as matchAllOffers.
-
-	m.announcementQueueMutex.Lock()
-	defer m.announcementQueueMutex.Unlock()
-	m.offerQueueMutex.Lock()
-	defer m.offerQueueMutex.Unlock()
+	// The lock-free queue length snapshots can be used for the following
+	// heuristic check, and avoid queue lock contention.
 
 	announcementLen := m.announcementQueue.getLen()
-	offerLen := m.offerQueue.Len()
+	offerLen := int(m.offerQueueLen.Load())
 
 	// When the load limit had been reached, and assuming the broker process
 	// is running only an in-proxy broker, it's likely, in practise, that
@@ -1025,7 +1127,10 @@ func (e MatcherLimitError) Error() string {
 
 // applyIPLimits checks per-proxy or per-client -- as determined by peer IP
 // address -- rate limits and queue entry limits.
-func (m *Matcher) applyIPLimits(isAnnouncement bool, limitIP string, proxyID ID) error {
+func (m *Matcher) applyIPLimits(
+	isAnnouncement bool,
+	isExempt bool,
+	limitIP string) error {
 
 	// Assumes m.announcementQueueMutex or m.offerQueueMutex is locked.
 
@@ -1037,16 +1142,31 @@ func (m *Matcher) applyIPLimits(isAnnouncement bool, limitIP string, proxyID ID)
 
 	if isAnnouncement {
 
-		// Skip limit checks for non-limited proxies.
-		if _, ok := m.announcementNonlimitedProxyIDs[proxyID]; ok {
-			return nil
-		}
-
 		entryCountByIP = m.announcementQueueEntryCountByIP
 		queueRateLimiters = m.announcementQueueRateLimiters
-		limitEntryCount = m.announcementLimitEntryCount
-		quantity = m.announcementRateLimitQuantity
-		interval = m.announcementRateLimitInterval
+
+		if isExempt {
+			// Use sanity limit checks for exempt proxies.
+			limitEntryCount = matcherMaxLimitEntryCount
+			quantity = matcherMaxRateLimitQuantity
+			interval = matcherMaxRateLimitInterval
+
+			// Allow limit-disabled configurations.
+			if m.announcementLimitEntryCount == 0 {
+				limitEntryCount = 0
+			}
+			if m.announcementRateLimitQuantity == 0 {
+				quantity = 0
+			}
+			if m.announcementRateLimitInterval == 0 {
+				interval = 0
+			}
+
+		} else {
+			limitEntryCount = m.announcementLimitEntryCount
+			quantity = m.announcementRateLimitQuantity
+			interval = m.announcementRateLimitInterval
+		}
 
 	} else {
 		entryCountByIP = m.offerQueueEntryCountByIP
@@ -1070,12 +1190,6 @@ func (m *Matcher) applyIPLimits(isAnnouncement bool, limitIP string, proxyID ID)
 	}
 
 	if limitEntryCount > 0 {
-
-		// Limitation: non-limited proxy ID entries are counted in
-		// entryCountByIP. If both a limited and non-limited proxy ingress
-		// from the same limitIP, then the non-limited entries will count
-		// against the limited proxy's limitEntryCount.
-
 		entryCount, ok := entryCountByIP[limitIP]
 		if ok && entryCount >= limitEntryCount {
 			return errors.Trace(
@@ -1096,11 +1210,26 @@ func (m *Matcher) addAnnouncementEntry(announcementEntry *announcementEntry) err
 		return errors.TraceNew("queue full")
 	}
 
+	isExempt := false
+	if m.announcementExemptSponsorIDs.Contains(announcementEntry.announcement.SponsorID) {
+		isExempt = true
+	} else if _, ok := m.announcementExemptProxyIDs[announcementEntry.announcement.ProxyID]; ok {
+		isExempt = true
+	}
+
+	if isExempt {
+		// Ensure that any exempt and non-exempt proxy that share the same
+		// client IP, don't use the same limits.
+		announcementEntry.limitIP += "-exempt"
+	}
+
 	// Ensure no single peer IP can enqueue a large number of entries or
 	// rapidly enqueue beyond the configured rate.
 	isAnnouncement := true
 	err := m.applyIPLimits(
-		isAnnouncement, announcementEntry.limitIP, announcementEntry.announcement.ProxyID)
+		isAnnouncement,
+		isExempt,
+		announcementEntry.limitIP)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -1183,7 +1312,7 @@ func (m *Matcher) addOfferEntry(offerEntry *offerEntry) error {
 	// rapidly enqueue beyond the configured rate.
 	isAnnouncement := false
 	err := m.applyIPLimits(
-		isAnnouncement, offerEntry.limitIP, ID{})
+		isAnnouncement, false, offerEntry.limitIP)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -1196,6 +1325,7 @@ func (m *Matcher) addOfferEntry(offerEntry *offerEntry) error {
 	}
 
 	offerEntry.queueReference = m.offerQueue.PushBack(offerEntry)
+	m.offerQueueLen.Add(1)
 
 	m.offerQueueEntryCountByIP[offerEntry.limitIP] += 1
 
@@ -1221,6 +1351,7 @@ func (m *Matcher) removeOfferEntry(aborting bool, offerEntry *offerEntry) {
 	}
 
 	m.offerQueue.Remove(offerEntry.queueReference)
+	m.offerQueueLen.Add(-1)
 
 	offerEntry.queueReference = nil
 
@@ -1243,27 +1374,17 @@ func (m *Matcher) pendingAnswerKey(proxyID ID, connectionID ID) string {
 	return string(proxyID[:]) + string(connectionID[:])
 }
 
-func getRateLimitIP(strIP string) string {
-
-	IP := net.ParseIP(strIP)
-	if IP == nil || IP.To4() != nil {
-		return strIP
-	}
-
-	// With IPv6, individual users or sites are users commonly allocated a /64
-	// or /56, so rate limit by /56.
-	return IP.Mask(net.CIDRMask(56, 128)).String()
-}
-
 // announcementMultiQueue is a set of announcement queues, one per common or
 // personal compartment ID, providing efficient iteration over announcements
 // matching a specified list of compartment IDs. announcementMultiQueue and
-// its underlying data structures are not safe for concurrent access.
+// its underlying data structures are not safe for concurrent access, with the
+// exception of announcementMultiQueue.getLen.
 type announcementMultiQueue struct {
 	priorityCommonCompartmentQueues map[ID]*announcementCompartmentQueue
 	commonCompartmentQueues         map[ID]*announcementCompartmentQueue
 	personalCompartmentQueues       map[ID]*announcementCompartmentQueue
-	totalEntries                    int
+	totalEntries                    atomic.Int64
+	iterator                        *announcementMatchIterator
 }
 
 // announcementCompartmentQueue is a single compartment queue within an
@@ -1288,7 +1409,6 @@ type announcementCompartmentQueue struct {
 type announcementMatchIterator struct {
 	multiQueue        *announcementMultiQueue
 	compartmentQueues []*announcementCompartmentQueue
-	compartmentIDs    []ID
 	nextEntries       []*list.Element
 }
 
@@ -1301,15 +1421,19 @@ type announcementQueueReference struct {
 }
 
 func newAnnouncementMultiQueue() *announcementMultiQueue {
-	return &announcementMultiQueue{
+	q := &announcementMultiQueue{
 		priorityCommonCompartmentQueues: make(map[ID]*announcementCompartmentQueue),
 		commonCompartmentQueues:         make(map[ID]*announcementCompartmentQueue),
 		personalCompartmentQueues:       make(map[ID]*announcementCompartmentQueue),
 	}
+	q.iterator = &announcementMatchIterator{
+		multiQueue: q,
+	}
+	return q
 }
 
 func (q *announcementMultiQueue) getLen() int {
-	return q.totalEntries
+	return int(q.totalEntries.Load())
 }
 
 func (q *announcementMultiQueue) enqueue(announcementEntry *announcementEntry) error {
@@ -1379,7 +1503,7 @@ func (q *announcementMultiQueue) enqueue(announcementEntry *announcementEntry) e
 		compartmentQueue.strictlyLimitedNATCount += 1
 	}
 
-	q.totalEntries += 1
+	q.totalEntries.Add(1)
 
 	announcementEntry.queueReference = announcementQueueReference{
 		multiQueue:       q,
@@ -1426,7 +1550,7 @@ func (r *announcementQueueReference) dequeue() bool {
 		delete(queues, r.compartmentQueue.compartmentID)
 	}
 
-	r.multiQueue.totalEntries -= 1
+	r.multiQueue.totalEntries.Add(-1)
 
 	// Mark as dequeued.
 	r.entry = nil
@@ -1434,13 +1558,27 @@ func (r *announcementQueueReference) dequeue() bool {
 	return true
 }
 
+// startMatching returns a newly initialized announcementMatchIterator for
+// queues corresponding to the specified compartment IDs.
+//
+// In order to reduce allocation and garbage collection churn from
+// matchAllOffers/matchOffer repeatedly calling startMatching, a single
+// announcementMatchIterator instance is retained and reused by all
+// startMatching calls. It is not safe to concurrently call startMatching or
+// concurrently use the returned announcementMatchIterator or retain the
+// returned announcementMatchIterator between startMatching calls.
 func (q *announcementMultiQueue) startMatching(
 	isCommonCompartments bool,
 	compartmentIDs []ID) *announcementMatchIterator {
 
-	iter := &announcementMatchIterator{
-		multiQueue: q,
-	}
+	// Reset the reused announcementMatchIterator fields, including clearing
+	// any references, while retaining the allocated slice capacity.
+
+	iter := q.iterator
+	clear(iter.compartmentQueues)
+	iter.compartmentQueues = iter.compartmentQueues[:0]
+	clear(iter.nextEntries)
+	iter.nextEntries = iter.nextEntries[:0]
 
 	// Find the matching compartment queues and initialize iteration over
 	// those queues. Building the set of matching queues is a linear time
@@ -1468,7 +1606,6 @@ func (q *announcementMultiQueue) startMatching(
 		for _, ID := range compartmentIDs {
 			if compartmentQueue, ok := compartmentQueues[ID]; ok {
 				iter.compartmentQueues = append(iter.compartmentQueues, compartmentQueue)
-				iter.compartmentIDs = append(iter.compartmentIDs, ID)
 				iter.nextEntries = append(iter.nextEntries, compartmentQueue.entries.Front())
 			}
 		}
@@ -1532,7 +1669,7 @@ func (iter *announcementMatchIterator) getNext() (*announcementEntry, bool) {
 	// A potential future enhancement is to add more iterator state to track
 	// which queue has the next oldest time to select on the following
 	// getNext call. Another potential enhancement is to remove fully
-	// consumed queues from compartmentQueues/compartmentIDs/nextEntries.
+	// consumed queues from compartmentQueues/nextEntries.
 
 	var selectedCandidate *announcementEntry
 	selectedIndex := -1

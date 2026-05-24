@@ -35,6 +35,7 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/buildinfo"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/inproxy"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/parameters"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/stacktrace"
@@ -537,10 +538,17 @@ func noticeWithDialParameters(noticeType string, dialParams *DialParameters, pos
 
 		if protocol.TunnelProtocolUsesFrontedMeek(dialParams.TunnelProtocol) {
 
-			meekResolvedIPAddress := dialParams.MeekResolvedIPAddress.Load().(string)
+			meekResolvedIPAddress, _ := dialParams.MeekResolvedIPAddress.Load().(string)
 			if meekResolvedIPAddress != "" {
 				nonredacted := common.EscapeRedactIPAddressString(meekResolvedIPAddress)
 				args = append(args, "meekResolvedIPAddress", nonredacted)
+			}
+		}
+
+		if postDial {
+			if routeBypassIPAddress := routeBypassIPAddressForNotice(dialParams); routeBypassIPAddress != "" {
+				nonredacted := common.EscapeRedactIPAddressString(routeBypassIPAddress)
+				args = append(args, "routeBypassIPAddress", nonredacted)
 			}
 		}
 
@@ -556,9 +564,11 @@ func noticeWithDialParameters(noticeType string, dialParams *DialParameters, pos
 			args = append(args, "meekHostHeader", dialParams.MeekHostHeader)
 		}
 
-		// MeekTransformedHostName is meaningful when meek is used, which is when MeekDialAddress != ""
+		// These fields are meaningful when meek is used, which is when
+		// MeekDialAddress != ""
 		if dialParams.MeekDialAddress != "" {
 			args = append(args, "meekTransformedHostName", dialParams.MeekTransformedHostName)
+			args = append(args, "meekPayloadPadding", dialParams.MeekEnablePayloadPadding)
 		}
 
 		if dialParams.TLSOSSHSNIServerName != "" {
@@ -716,11 +726,63 @@ func noticeWithDialParameters(noticeType string, dialParams *DialParameters, pos
 			}
 		}
 
+		if dialParams.DSLPrioritizedDial && len(dialParams.DSLPrioritizedDialReason) > 0 {
+			args = append(args, "DSLPrioritizedReason", dialParams.DSLPrioritizedDialReason)
+		}
+		if dialParams.DSLPrioritizedDial && len(dialParams.DSLPrioritizedTunnelProtocol) > 0 {
+			args = append(args, "DSLPrioritizedTunnelProtocol", dialParams.DSLPrioritizedTunnelProtocol)
+		}
+
 	}
 
 	singletonNoticeLogger.outputNotice(
 		noticeType, noticeIsDiagnostic,
 		args...)
+}
+
+func routeBypassIPAddressForNotice(dialParams *DialParameters) string {
+	candidates := make([]string, 0, 6)
+
+	if value := dialParams.MeekResolvedIPAddress.Load(); value != nil {
+		if meekResolvedIPAddress, ok := value.(string); ok && meekResolvedIPAddress != "" {
+			candidates = append(candidates, meekResolvedIPAddress)
+		}
+	}
+
+	if dialParams.SteeringIP != "" {
+		candidates = append(candidates, dialParams.SteeringIP)
+	}
+
+	if dialParams.ResolveParameters != nil &&
+		dialParams.ResolveParameters.PreresolvedIPAddress != "" {
+		candidates = append(candidates, dialParams.ResolveParameters.PreresolvedIPAddress)
+	}
+
+	for _, address := range []string{dialParams.DirectDialAddress, dialParams.MeekDialAddress} {
+		if address == "" {
+			continue
+		}
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			host = address
+		}
+		if host != "" {
+			candidates = append(candidates, host)
+		}
+	}
+
+	if dialParams.ServerEntry != nil && dialParams.ServerEntry.IpAddress != "" {
+		candidates = append(candidates, dialParams.ServerEntry.IpAddress)
+	}
+
+	for _, candidate := range candidates {
+		ip := net.ParseIP(candidate)
+		if ip == nil || ip.To4() == nil {
+			continue
+		}
+		return ip.String()
+	}
+	return ""
 }
 
 // NoticeConnectingServer reports parameters and details for a single connection attempt
@@ -1163,7 +1225,9 @@ func NoticeInproxyProxyActivity(
 	connectingClients int32,
 	connectedClients int32,
 	bytesUp int64,
-	bytesDown int64) {
+	bytesDown int64,
+	personalRegionActivity map[string]inproxy.RegionActivitySnapshot,
+	commonRegionActivity map[string]inproxy.RegionActivitySnapshot) {
 
 	singletonNoticeLogger.outputNotice(
 		"InproxyProxyActivity", noticeIsNotDiagnostic,
@@ -1171,7 +1235,9 @@ func NoticeInproxyProxyActivity(
 		"connectingClients", connectingClients,
 		"connectedClients", connectedClients,
 		"bytesUp", bytesUp,
-		"bytesDown", bytesDown)
+		"bytesDown", bytesDown,
+		"personalRegionActivity", personalRegionActivity,
+		"commonRegionActivity", commonRegionActivity)
 }
 
 // NoticeInproxyProxyTotalActivity reports how many proxied bytes have been
@@ -1191,6 +1257,11 @@ func NoticeInproxyProxyTotalActivity(
 		"connectedClients", connectedClients,
 		"totalBytesUp", totalBytesUp,
 		"totalBytesDown", totalBytesDown)
+}
+
+// NoticeLightProxyAvailable indicates that a light proxy is available for use.
+func NoticeLightProxyAvailable() {
+	singletonNoticeLogger.outputNotice("LightProxyAvailable", 0)
 }
 
 type repetitiveNoticeState struct {
@@ -1468,7 +1539,7 @@ func (log *commonLogTrace) Info(args ...interface{}) {
 }
 
 func (log *commonLogTrace) Warning(args ...interface{}) {
-	log.outputNotice("Alert", args...)
+	log.outputNotice("Warning", args...)
 }
 
 func (log *commonLogTrace) Error(args ...interface{}) {

@@ -41,6 +41,7 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/fragmentor"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/inproxy"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/light"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/parameters"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
@@ -154,6 +155,16 @@ func (serverContext *ServerContext) doHandshakeRequest(ignoreStatsRegexps bool) 
 		requestedMissingProviderID = true
 		params["missing_server_entry_provider_id"] =
 			serverContext.tunnel.dialParams.ServerEntry.Tag
+	}
+
+	// When specified, send the client's HAProxy PROXY protocol header opt-in
+	// or opt-out to the server.
+	if serverContext.tunnel.config.EnableProxyProtocolHeaders != nil {
+		enabled := "0"
+		if *serverContext.tunnel.config.EnableProxyProtocolHeaders {
+			enabled = "1"
+		}
+		params["enable_proxy_protocol_headers"] = enabled
 	}
 
 	doTactics := !serverContext.tunnel.config.DisableTactics
@@ -473,7 +484,7 @@ func (serverContext *ServerContext) doHandshakeRequest(ignoreStatsRegexps bool) 
 // (truncated to an hour, as a privacy measure). As client clocks are
 // unreliable, the server returns new last_connected values for the client to
 // store and send next time it connects.
-func (serverContext *ServerContext) DoConnectedRequest() error {
+func (serverContext *ServerContext) DoConnectedRequest(controller *Controller) error {
 
 	// Limitation: as currently implemented, the last_connected exchange isn't a
 	// distributed, atomic operation. When clients send the connected request,
@@ -514,6 +525,18 @@ func (serverContext *ServerContext) DoConnectedRequest() error {
 	// serverContext.tunnel.establishDuration is nanoseconds; report milliseconds
 	params["establishment_duration"] =
 		fmt.Sprintf("%d", serverContext.tunnel.establishDuration/time.Millisecond)
+
+	lightProxyClient, _ := controller.lightProxyClient.Load().(*light.Client)
+	if lightProxyClient != nil {
+		metrics := lightProxyClient.GetMetrics()
+		params["light_proxy_id"] = metrics.ProxyID
+		params["light_proxy_entry_tracker"] = strconv.FormatInt(metrics.ProxyEntryTracker, 10)
+		params["light_proxy_dial_IPv4"] = strconv.FormatInt(metrics.DialIPv4Count, 10)
+		if metrics.HasIPv6 {
+			params["light_proxy_dial_IPv6"] = strconv.FormatInt(metrics.DialIPv6Count, 10)
+		}
+		params["light_proxy_dial_failed"] = strconv.FormatInt(metrics.DialFailedCount, 10)
+	}
 
 	var response []byte
 	if serverContext.psiphonHttpsClient == nil {
@@ -1212,14 +1235,17 @@ func getBaseAPIParameters(
 			params["meek_host_header"] = dialParams.MeekHostHeader
 		}
 
-		// MeekTransformedHostName is meaningful when meek is used, which is when
+		// These fields are meaningful when meek is used, which is when
 		// MeekDialAddress != ""
 		if dialParams.MeekDialAddress != "" {
+
 			transformedHostName := "0"
 			if dialParams.MeekTransformedHostName {
 				transformedHostName = "1"
 			}
 			params["meek_transformed_host_name"] = transformedHostName
+
+			// meek_payload_padding is logged by the server
 		}
 
 		if dialParams.TLSOSSHSNIServerName != "" {
@@ -1291,6 +1317,12 @@ func getBaseAPIParameters(
 
 		if dialParams.DSLPrioritizedDial {
 			params["dsl_prioritized"] = "1"
+			if len(dialParams.DSLPrioritizedDialReason) > 0 {
+				params["dsl_prioritized_reason"] = dialParams.DSLPrioritizedDialReason
+			}
+			if dialParams.DSLPrioritizedTunnelProtocol != "" {
+				params["dsl_prioritized_tunnel_protocol"] = dialParams.DSLPrioritizedTunnelProtocol
+			}
 		}
 
 		// dialParams.DialDuration is nanoseconds; report milliseconds

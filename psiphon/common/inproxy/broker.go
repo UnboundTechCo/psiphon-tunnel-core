@@ -22,6 +22,8 @@ package inproxy
 import (
 	"context"
 	std_errors "errors"
+	"fmt"
+	"maps"
 	"net"
 	"strconv"
 	"sync"
@@ -101,8 +103,9 @@ type Broker struct {
 	proxyQualityState       *ProxyQualityState
 	knownServerInitiatorIDs sync.Map
 
-	commonCompartmentsMutex sync.Mutex
-	commonCompartments      *consistent.Consistent
+	commonCompartmentsMutex   sync.Mutex
+	commonCompartments        *consistent.Consistent
+	sponsorCommonCompartments map[string]ID
 
 	proxyAnnounceTimeout       atomic.Int64
 	clientOfferTimeout         atomic.Int64
@@ -130,14 +133,26 @@ type BrokerConfig struct {
 	// tactics or embedded in OSLs. Clients must supply a valid compartment
 	// ID to match with a proxy.
 	//
-	// A BrokerConfig must supply at least one compartment ID, or
+	// A BrokerConfig must supply at least one common compartment ID, or
 	// SetCompartmentIDs must be called with at least one compartment ID
-	// before calling Start.
+	// before calling Start. When SponsorCommonCompartmentIDs is specified,
+	// there must be at least one compartment ID that's not assigned to a
+	// sponsor ID.
 	//
 	// When only one, single common compartment ID is configured, it can serve
 	// as an (obfuscation) secret that clients must obtain, via tactics, to
 	// enable in-proxy participation.
 	CommonCompartmentIDs []ID
+
+	// SponsorCommonCompartmentIDs may be used to configure a specific common
+	// compartment ID assignment for the given proxy sponsor IDs. When
+	// configured, proxies with a specified sponsor ID are always mapped to
+	// the corresponding compartment ID, and only those proxies are mapped to
+	// that compartment ID. All proxies with sponsor IDs not in
+	// SponsorCommonCompartmentIDs are mapped to the remaining common
+	// compartment IDs in CommonCompartmentIDs. Compartment IDs specified in
+	// SponsorCommonCompartmentIDs must appear in CommonCompartmentIDs.
+	SponsorCommonCompartmentIDs map[string]ID
 
 	// AllowProxy is a callback which can indicate whether a proxy with the
 	// given GeoIP data is allowed to match with common compartment ID
@@ -223,10 +238,11 @@ type BrokerConfig struct {
 	PendingServerReportsTTL    time.Duration
 
 	// Announcement queue limit configuration.
-	MatcherAnnouncementLimitEntryCount    int
-	MatcherAnnouncementRateLimitQuantity  int
-	MatcherAnnouncementRateLimitInterval  time.Duration
-	MatcherAnnouncementNonlimitedProxyIDs []ID
+	MatcherAnnouncementLimitEntryCount   int
+	MatcherAnnouncementRateLimitQuantity int
+	MatcherAnnouncementRateLimitInterval time.Duration
+	MatcherAnnouncementExemptProxyIDs    []ID
+	MatcherAnnouncementExemptSponsorIDs  []string
 
 	// Offer queue limit configuration.
 	MatcherOfferLimitEntryCount   int
@@ -299,10 +315,11 @@ func NewBroker(config *BrokerConfig) (*Broker, error) {
 		matcher: NewMatcher(&MatcherConfig{
 			Logger: config.Logger,
 
-			AnnouncementLimitEntryCount:    config.MatcherAnnouncementLimitEntryCount,
-			AnnouncementRateLimitQuantity:  config.MatcherAnnouncementRateLimitQuantity,
-			AnnouncementRateLimitInterval:  config.MatcherAnnouncementRateLimitInterval,
-			AnnouncementNonlimitedProxyIDs: config.MatcherAnnouncementNonlimitedProxyIDs,
+			AnnouncementLimitEntryCount:   config.MatcherAnnouncementLimitEntryCount,
+			AnnouncementRateLimitQuantity: config.MatcherAnnouncementRateLimitQuantity,
+			AnnouncementRateLimitInterval: config.MatcherAnnouncementRateLimitInterval,
+			AnnouncementExemptProxyIDs:    config.MatcherAnnouncementExemptProxyIDs,
+			AnnouncementExemptSponsorIDs:  config.MatcherAnnouncementExemptSponsorIDs,
 
 			OfferLimitEntryCount:   config.MatcherOfferLimitEntryCount,
 			OfferRateLimitQuantity: config.MatcherOfferRateLimitQuantity,
@@ -343,7 +360,9 @@ func NewBroker(config *BrokerConfig) (*Broker, error) {
 		})
 
 	if len(config.CommonCompartmentIDs) > 0 {
-		err = b.initializeCommonCompartmentIDHashing(config.CommonCompartmentIDs)
+		err = b.initializeCommonCompartmentIDHashing(
+			config.CommonCompartmentIDs,
+			config.SponsorCommonCompartmentIDs)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
@@ -367,7 +386,9 @@ func (b *Broker) Stop() {
 
 // SetCommonCompartmentIDs sets a new list of common compartment IDs,
 // replacing the previous configuration.
-func (b *Broker) SetCommonCompartmentIDs(commonCompartmentIDs []ID) error {
+func (b *Broker) SetCommonCompartmentIDs(
+	commonCompartmentIDs []ID,
+	sponsorCommonCompartmentIDs map[string]ID) error {
 
 	// TODO: initializeCommonCompartmentIDHashing is called regardless whether
 	// commonCompartmentIDs changes the previous configuration. To avoid the
@@ -375,7 +396,9 @@ func (b *Broker) SetCommonCompartmentIDs(commonCompartmentIDs []ID) error {
 	// initializeCommonCompartmentIDHashing, add a mechanism to first quickly
 	// check for changes?
 
-	return errors.Trace(b.initializeCommonCompartmentIDHashing(commonCompartmentIDs))
+	return errors.Trace(b.initializeCommonCompartmentIDHashing(
+		commonCompartmentIDs,
+		sponsorCommonCompartmentIDs))
 }
 
 // SetTimeouts sets new timeout values, replacing the previous configuration.
@@ -402,10 +425,12 @@ func (b *Broker) SetLimits(
 	matcherAnnouncementLimitEntryCount int,
 	matcherAnnouncementRateLimitQuantity int,
 	matcherAnnouncementRateLimitInterval time.Duration,
-	matcherAnnouncementNonlimitedProxyIDs []ID,
+	matcherAnnouncementExemptProxyIDs []ID,
+	matcherAnnouncementExemptSponsorIDs []string,
 	matcherOfferLimitEntryCount int,
 	matcherOfferRateLimitQuantity int,
 	matcherOfferRateLimitInterval time.Duration,
+	matcherOfferMinimumDeadline time.Duration,
 	maxCompartmentIDs int,
 	dslRequestRateLimitQuantity int,
 	dslRequestRateLimitInterval time.Duration) {
@@ -414,10 +439,12 @@ func (b *Broker) SetLimits(
 		matcherAnnouncementLimitEntryCount,
 		matcherAnnouncementRateLimitQuantity,
 		matcherAnnouncementRateLimitInterval,
-		matcherAnnouncementNonlimitedProxyIDs,
+		matcherAnnouncementExemptProxyIDs,
+		matcherAnnouncementExemptSponsorIDs,
 		matcherOfferLimitEntryCount,
 		matcherOfferRateLimitQuantity,
-		matcherOfferRateLimitInterval)
+		matcherOfferRateLimitInterval,
+		matcherOfferMinimumDeadline)
 
 	b.maxCompartmentIDs.Store(
 		int64(common.ValueOrDefault(maxCompartmentIDs, MaxCompartmentIDs)))
@@ -729,16 +756,21 @@ func (b *Broker) handleProxyAnnounce(
 	// existing, cached tactics. In the case where tactics have changed,
 	// don't enqueue the proxy announcement and return no-match so that the
 	// proxy can store and apply the new tactics before announcing again.
+	//
+	// For PreCheckTactics requests, an immediate no-match response is
+	// returned even when there are no new tactics.
 
 	var tacticsPayload []byte
-	if announceRequest.CheckTactics {
+	if announceRequest.CheckTactics || announceRequest.PreCheckTactics {
 		tacticsPayload, newTacticsTag, err =
 			b.config.GetTacticsPayload(geoIPData, apiParams)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
 
-		if tacticsPayload != nil && newTacticsTag != "" {
+		if (tacticsPayload != nil && newTacticsTag != "") ||
+			announceRequest.PreCheckTactics {
+
 			responsePayload, err := MarshalProxyAnnounceResponse(
 				&ProxyAnnounceResponse{
 					TacticsPayload: tacticsPayload,
@@ -756,11 +788,23 @@ func (b *Broker) handleProxyAnnounce(
 	// such as censored locations, from announcing. Proxies with personal
 	// compartment IDs are always allowed, as they will be used only by
 	// clients specifically configured to use them.
+	//
+	// AllowProxy is not enforced until after CheckTactics/PreCheckTactics
+	// cases, which may return an immediate response. This allows proxies to
+	// download new tactics that may set AllowProxy, which well-behaved
+	// proxies can enforce locally as well.
 
 	if !hasPersonalCompartmentIDs &&
 		!b.config.AllowProxy(geoIPData) {
 
-		return nil, errors.TraceNew("proxy disallowed")
+		// Send a "limited" response so the proxy backs off.
+		limitedErr = errors.TraceNew("proxy disallowed")
+		responsePayload, err := MarshalProxyAnnounceResponse(
+			&ProxyAnnounceResponse{Limited: true})
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		return responsePayload, nil
 	}
 
 	// Assign this proxy to a common compartment ID, unless it has specified a
@@ -768,9 +812,15 @@ func (b *Broker) handleProxyAnnounce(
 	// keyed with the proxy ID, in an effort to keep proxies consistently
 	// assigned to the same compartment.
 
+	// sponsor_id is validated by b.config.APIParameterValidator.
+	sponsorID := ""
+	if param, ok := apiParams["sponsor_id"]; ok {
+		sponsorID, _ = param.(string)
+	}
+
 	var commonCompartmentIDs []ID
 	if !hasPersonalCompartmentIDs {
-		compartmentID, err := b.selectCommonCompartmentID(proxyID)
+		compartmentID, err := b.selectCommonCompartmentID(proxyID, sponsorID)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
@@ -866,6 +916,7 @@ func (b *Broker) handleProxyAnnounce(
 				PortMappingTypes:       announceRequest.Metrics.PortMappingTypes,
 			},
 			ProxyID:      initiatorID,
+			SponsorID:    sponsorID,
 			ProxyMetrics: announceRequest.Metrics,
 			ConnectionID: connectionID,
 		})
@@ -952,6 +1003,7 @@ func (b *Broker) handleProxyAnnounce(
 			TrafficShapingParameters:    clientOffer.TrafficShapingParameters,
 			NetworkProtocol:             clientOffer.NetworkProtocol,
 			DestinationAddress:          clientOffer.DestinationAddress,
+			ClientRegion:                clientOffer.Properties.GeoIPData.Country,
 		})
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -1032,7 +1084,7 @@ func (b *Broker) handleClientOffer(
 			logFields["preferred_nat_match"] =
 				clientMatchOffer.Properties.IsPreferredNATMatch(&proxyMatchAnnouncement.Properties)
 
-			// TODO: also log proxy ice_candidate_types and has_IPv6; for the
+			// TODO: also log proxy ice_candidate_types and has_IPv4/6; for the
 			// client, these values are added by ValidateAndGetLogFields.
 		}
 		if timedOut {
@@ -1089,7 +1141,15 @@ func (b *Broker) handleClientOffer(
 	if !hasPersonalCompartmentIDs &&
 		!b.config.AllowClient(geoIPData) {
 
-		return nil, errors.TraceNew("client disallowed")
+		// Send a "limited" response so the client retains its broker client
+		// and doesn't retry the offer.
+		limitedErr = errors.TraceNew("client disallowed")
+		responsePayload, err := MarshalClientOfferResponse(
+			&ClientOfferResponse{Limited: true})
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		return responsePayload, nil
 	}
 
 	// Validate that the proxy destination specified by the client is a valid
@@ -1184,7 +1244,8 @@ func (b *Broker) handleClientOffer(
 		var limitError *MatcherLimitError
 		limited := std_errors.As(err, &limitError)
 
-		timeout := offerCtx.Err() == context.DeadlineExceeded
+		timeout := offerCtx.Err() == context.DeadlineExceeded ||
+			std_errors.Is(err, errOfferDropped)
 
 		// A no-match response is sent in the case of a timeout awaiting a
 		// match. The faster-failing rate or entry limiting case also results
@@ -1204,6 +1265,13 @@ func (b *Broker) handleClientOffer(
 			// InproxyClientOfferRequestTimeout in tactics, should be configured
 			// so that the broker will timeout first and have an opportunity to
 			// send this response before the client times out.
+			//
+			// In the errOfferDropped case, the matcher dropped the offer due
+			// to age. While this is distinct from a timeout after a
+			// completed match, the same timed_out log field is set. The
+			// cases can be distinguished based on elapsed_time, as the
+			// dropped cases will have an elapsed_time less than
+			// InproxyBrokerClientOfferTimeout.
 			timedOut = true
 		}
 
@@ -1363,8 +1431,10 @@ func (b *Broker) handleProxyAnswer(
 		if answerError != "" {
 			// This is a proxy-reported error that occurred while creating the answer.
 			logFields["answer_error"] = answerError
+			logFields["error"] = fmt.Sprintf("proxy answer error: %s", answerError)
 		}
 		if retErr != nil {
+			// For the error field, retErr takes precedence over answerError
 			logFields["error"] = retErr.Error()
 		}
 		logFields.Add(transportLogFields)
@@ -1392,6 +1462,18 @@ func (b *Broker) handleProxyAnswer(
 	hasPersonalCompartmentIDs, err := b.matcher.AnnouncementHasPersonalCompartmentIDs(
 		initiatorID, answerRequest.ConnectionID)
 	if err != nil {
+
+		if std_errors.Is(err, errNoPendingAnswer) {
+			// Return a response. This avoids returning a
+			// broker-client-resetting 404 in this case.
+			responsePayload, err := MarshalProxyAnswerResponse(
+				&ProxyAnswerResponse{NoAwaitingClient: true})
+			if err != nil {
+				return nil, errors.Trace(err)
+			}
+			return responsePayload, nil
+		}
+
 		return nil, errors.Trace(err)
 	}
 
@@ -1405,9 +1487,6 @@ func (b *Broker) handleProxyAnswer(
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-
-	answerSDP := answerRequest.ProxyAnswerSDP
-	answerSDP.SDP = string(filteredSDP)
 
 	if answerRequest.AnswerError != "" {
 
@@ -1424,6 +1503,9 @@ func (b *Broker) handleProxyAnswer(
 		// Note that neither ProxyID nor ProxyIP is returned to the client.
 		// These fields are used internally in the matcher.
 
+		answerSDP := answerRequest.ProxyAnswerSDP
+		answerSDP.SDP = string(filteredSDP)
+
 		proxyAnswer = &MatchAnswer{
 			ProxyIP:        proxyIP,
 			ProxyID:        initiatorID,
@@ -1433,6 +1515,18 @@ func (b *Broker) handleProxyAnswer(
 
 		err = b.matcher.Answer(proxyAnswer)
 		if err != nil {
+
+			if std_errors.Is(err, errNoPendingAnswer) {
+				// Return a response. This avoids returning a
+				// broker-client-resetting 404 in this case.
+				responsePayload, err := MarshalProxyAnswerResponse(
+					&ProxyAnswerResponse{NoAwaitingClient: true})
+				if err != nil {
+					return nil, errors.Trace(err)
+				}
+				return responsePayload, nil
+			}
+
 			return nil, errors.Trace(err)
 		}
 	}
@@ -1722,7 +1816,7 @@ func (b *Broker) handleClientDSL(
 	rateLimitParams := b.dslRequestRateLimitParams.Load().(*brokerRateLimitParams)
 	err := brokerRateLimit(
 		b.dslRequestRateLimiters,
-		clientIP,
+		common.GetRateLimitIP(clientIP),
 		rateLimitParams.quantity,
 		rateLimitParams.interval)
 	if err != nil {
@@ -2007,25 +2101,45 @@ func (b *Broker) isCommonCompartmentIDHashingInitialized() bool {
 }
 
 func (b *Broker) initializeCommonCompartmentIDHashing(
-	commonCompartmentIDs []ID) error {
+	allCommonCompartmentIDs []ID,
+	sponsorCommonCompartmentIDs map[string]ID) error {
 
 	b.commonCompartmentsMutex.Lock()
 	defer b.commonCompartmentsMutex.Unlock()
+
+	// The consistent package doesn't allow duplicate members.
+	allCompartmentIDs := make(map[ID]bool, len(allCommonCompartmentIDs))
+	for _, compartmentID := range allCommonCompartmentIDs {
+		if allCompartmentIDs[compartmentID] {
+			return errors.TraceNew("duplicate common compartment IDs")
+		}
+		allCompartmentIDs[compartmentID] = true
+	}
+
+	// Remove all sponsor ID-mapped common compartment IDs from the list of
+	// all common compartment IDs. Only the remaining list will be used for
+	// random assignment with consistent hashing.
+	sponsorCompartmentID := make(map[ID]bool)
+	for _, ID := range sponsorCommonCompartmentIDs {
+		if _, ok := allCompartmentIDs[ID]; !ok {
+			return errors.TraceNew("invalid sponsor common compartment ID")
+		}
+		sponsorCompartmentID[ID] = true
+	}
+	nonSponsorCommonCompartmentIDs := []ID{}
+	for _, ID := range allCommonCompartmentIDs {
+		if !sponsorCompartmentID[ID] {
+			nonSponsorCommonCompartmentIDs =
+				append(nonSponsorCommonCompartmentIDs, ID)
+		}
+	}
+	commonCompartmentIDs := nonSponsorCommonCompartmentIDs
 
 	// At least one common compartment ID is required. At a minimum, one ID
 	// will be used and distributed to clients via tactics, limiting matching
 	// to those clients targeted to receive that tactic parameters.
 	if len(commonCompartmentIDs) == 0 {
-		return errors.TraceNew("missing common compartment IDs")
-	}
-
-	// The consistent package doesn't allow duplicate members.
-	checkDup := make(map[ID]bool, len(commonCompartmentIDs))
-	for _, compartmentID := range commonCompartmentIDs {
-		if checkDup[compartmentID] {
-			return errors.TraceNew("duplicate common compartment IDs")
-		}
-		checkDup[compartmentID] = true
+		return errors.TraceNew("missing common compartment ID")
 	}
 
 	// Proxies without personal compartment IDs are randomly assigned to the
@@ -2055,6 +2169,8 @@ func (b *Broker) initializeCommonCompartmentIDHashing(
 			Hasher:            xxhasher{},
 		})
 
+	b.sponsorCommonCompartments = maps.Clone(sponsorCommonCompartmentIDs)
+
 	return nil
 }
 
@@ -2075,10 +2191,16 @@ func (m consistentMember) String() string {
 	return string(m)
 }
 
-func (b *Broker) selectCommonCompartmentID(proxyID ID) (ID, error) {
+func (b *Broker) selectCommonCompartmentID(proxyID ID, sponsorID string) (ID, error) {
 
 	b.commonCompartmentsMutex.Lock()
 	defer b.commonCompartmentsMutex.Unlock()
+
+	if sponsorID != "" {
+		if compartmentID, ok := b.sponsorCommonCompartments[sponsorID]; ok {
+			return compartmentID, nil
+		}
+	}
 
 	compartmentID, err := IDFromString(
 		b.commonCompartments.LocateKey(proxyID[:]).String())

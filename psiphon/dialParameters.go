@@ -72,10 +72,13 @@ type DialParameters struct {
 	CandidateNumber         int                   `json:"-"`
 	EstablishedTunnelsCount int                   `json:"-"`
 
-	ServerEntryIterationUniqueCandidateEstimate   int `json:"-"`
-	ServerEntryIterationMovedToFrontCount         int `json:"-"`
-	ServerEntryIterationFirstFrontedMeekCandidate int `json:"-"`
-	FrontedMeekCDNCandidateNumber                 int `json:"-"`
+	ServerEntryIterationUniqueCandidateEstimate   int  `json:"-"`
+	ServerEntryIterationMovedToFrontCount         int  `json:"-"`
+	ServerEntryIterationFirstFrontedMeekCandidate int  `json:"-"`
+	FrontedMeekCDNCandidateNumber                 int  `json:"-"`
+	FrontedMeekCDNScanCandidate                   bool `json:"-"`
+	frontedMeekCDNScanStateKey                    string
+	frontedMeekCDNScanSelectedCandidate           parameters.FrontedMeekCDNScanCandidate
 
 	IsExchanged bool `json:",omitempty"`
 
@@ -124,6 +127,11 @@ type DialParameters struct {
 	MeekHostHeader             string       `json:",omitempty"`
 	MeekObfuscatorPaddingSeed  *prng.Seed   `json:",omitempty"`
 	MeekResolvedIPAddress      atomic.Value `json:"-"`
+
+	MeekEnablePayloadPadding          bool    `json:",omitempty"`
+	MeekPayloadPaddingMinSize         int     `json:",omitempty"`
+	MeekPayloadPaddingMaxSize         int     `json:",omitempty"`
+	MeekPayloadPaddingOmitProbability float64 `json:",omitempty"`
 
 	TLSOSSHTransformedSNIServerName bool       `json:",omitempty"`
 	TLSOSSHSNIServerName            string     `json:",omitempty"`
@@ -183,6 +191,8 @@ type DialParameters struct {
 
 	DSLPendingPrioritizeDialTimestamp time.Time `json:",omitempty"`
 	DSLPrioritizedDial                bool      `json:",omitempty"`
+	DSLPrioritizedDialReason          string    `json:",omitempty"`
+	DSLPrioritizedTunnelProtocol      string    `json:",omitempty"`
 
 	quicTLSClientSessionCache *common.TLSClientSessionCacheWrapper  `json:"-"`
 	tlsClientSessionCache     *common.UtlsClientSessionCacheWrapper `json:"-"`
@@ -224,7 +234,9 @@ func MakeDialParameters(
 	tlsClientSessionCache utls.ClientSessionCache,
 	upstreamProxyErrorCallback func(error),
 	canReplay func(serverEntry *protocol.ServerEntry, replayProtocol string) bool,
-	selectProtocol func(serverEntry *protocol.ServerEntry) (string, bool),
+	selectProtocol func(
+		serverEntry *protocol.ServerEntry,
+		prioritizeTunnelProtocol string) (string, bool),
 	serverEntry *protocol.ServerEntry,
 	inproxyClientBrokerClientManager *InproxyBrokerClientManager,
 	inproxyClientNATStateManager *InproxyNATStateManager,
@@ -281,6 +293,7 @@ func MakeDialParameters(
 	replayShadowsocksPrefix := p.Bool(parameters.ReplayShadowsocksPrefix)
 	replayInproxySTUN := p.Bool(parameters.ReplayInproxySTUN)
 	replayInproxyWebRTC := p.Bool(parameters.ReplayInproxyWebRTC)
+	replayMeekPayloadPadding := p.Bool(parameters.ReplayMeekPayloadPadding)
 
 	// Check for existing dial parameters for this server/network ID.
 
@@ -316,6 +329,8 @@ func MakeDialParameters(
 	// server entry happens to have been used for a tunnel protocol. See
 	// fetchTactics.
 
+	dslPrioritizeDialReason := ""
+	dslPrioritizeTunnelProtocol := ""
 	dslPendingPrioritizeDial :=
 		dialParams != nil && !dialParams.DSLPendingPrioritizeDialTimestamp.IsZero()
 
@@ -337,6 +352,9 @@ func MakeDialParameters(
 				NoticeWarning("DeleteDialParameters failed: %s", err)
 			}
 		}
+
+		dslPrioritizeDialReason = dialParams.DSLPrioritizedDialReason
+		dslPrioritizeTunnelProtocol = dialParams.DSLPrioritizedTunnelProtocol
 
 		// Replace the placeholder with new dial parameters.
 		dialParams = nil
@@ -406,7 +424,7 @@ func MakeDialParameters(
 					p.Strings(parameters.ConjureSTUNServerAddresses),
 					dialParams.ConjureSTUNServerAddress)) ||
 			(dialParams.InproxySTUNDialParameters != nil &&
-				dialParams.InproxySTUNDialParameters.IsValidClientReplay(p)) ||
+				!dialParams.InproxySTUNDialParameters.IsValidClientReplay(p)) ||
 
 			// Legacy clients use ConjureAPIRegistrarURL with
 			// gotapdance.tapdance.APIRegistrar and new clients use
@@ -494,6 +512,13 @@ func MakeDialParameters(
 	// parameters are replayed.
 	dialParams.DSLPrioritizedDial =
 		dslPendingPrioritizeDial || (isReplay && dialParams.DSLPrioritizedDial)
+	if !dialParams.DSLPrioritizedDial {
+		dialParams.DSLPrioritizedDialReason = ""
+		dialParams.DSLPrioritizedTunnelProtocol = ""
+	} else if dslPendingPrioritizeDial {
+		dialParams.DSLPrioritizedDialReason = dslPrioritizeDialReason
+		dialParams.DSLPrioritizedTunnelProtocol = dslPrioritizeTunnelProtocol
+	}
 
 	// Even when replaying, LastUsedTimestamp is updated to extend the TTL of
 	// replayed dial parameters which will be updated in the datastore upon
@@ -554,12 +579,17 @@ func MakeDialParameters(
 
 	if !isReplay && !isExchanged {
 
+		// selectProtocol may ignore dslPrioritizeTunnelProtocol in preferInproxy
+		// and InitialLimit and LimitTunnelProtocol cases. Note that
+		// dsl_prioritized_tunnel_protocol is intentionally still reported as-is
+		// in server_tunnel.
+
 		// TODO: should there be a pre-check of selectProtocol before incurring
 		// overhead of unmarshaling dial parameters? In may be that a server entry
 		// is fully incapable of satisfying the current protocol selection
 		// constraints.
 
-		selectedProtocol, ok := selectProtocol(serverEntry)
+		selectedProtocol, ok := selectProtocol(serverEntry, dslPrioritizeTunnelProtocol)
 		if !ok {
 			return nil, nil
 		}
@@ -1078,6 +1108,27 @@ func MakeDialParameters(
 		}
 	}
 
+	if (!isReplay || !replayMeekPayloadPadding) &&
+		protocol.TunnelProtocolUsesMeek(dialParams.TunnelProtocol) {
+
+		limitTunnelProtocols := p.TunnelProtocols(
+			parameters.MeekPayloadPaddingLimitTunnelProtocols)
+
+		if len(limitTunnelProtocols) == 0 ||
+			common.Contains(limitTunnelProtocols, dialParams.TunnelProtocol) {
+
+			if p.WeightedCoinFlip(parameters.MeekPayloadPaddingProbability) {
+
+				dialParams.MeekEnablePayloadPadding = true
+				dialParams.MeekPayloadPaddingOmitProbability =
+					p.Float(parameters.MeekPayloadPaddingClientOmitProbability)
+				dialParams.MeekPayloadPaddingMinSize =
+					p.Int(parameters.MeekPayloadPaddingClientMinSize)
+				dialParams.MeekPayloadPaddingMaxSize =
+					p.Int(parameters.MeekPayloadPaddingClientMaxSize)
+			}
+		}
+	}
 	if !isReplay || !replayHoldOffTunnel {
 
 		var HoldOffTunnelProtocolDuration time.Duration
@@ -1466,7 +1517,8 @@ func MakeDialParameters(
 
 	case protocol.TUNNEL_PROTOCOL_FRONTED_MEEK,
 		protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_CDN,
-		protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH:
+		protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH,
+		protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH:
 
 		dialParams.MeekDialAddress = net.JoinHostPort(dialParams.MeekFrontingDialAddress, dialParams.DialPortNumber)
 		dialParams.MeekHostHeader = dialParams.MeekFrontingHost
@@ -1478,7 +1530,8 @@ func MakeDialParameters(
 			dialParams.MeekSNIServerName = dialParams.MeekFrontingDialAddress
 		}
 
-	case protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP:
+	case protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP,
+		protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP_CDN:
 
 		dialParams.MeekDialAddress = net.JoinHostPort(dialParams.MeekFrontingDialAddress, dialParams.DialPortNumber)
 		dialParams.MeekHostHeader = dialParams.MeekFrontingHost
@@ -1764,7 +1817,7 @@ func MakeDialParameters(
 		UpstreamProxyURL:              config.UpstreamProxyURL,
 		CustomHeaders:                 dialCustomHeaders,
 		BPFProgramInstructions:        dialParams.BPFProgramInstructions,
-		DeviceBinder:                  config.deviceBinder,
+		DeviceBinder:                  config.deviceBinder(),
 		IPv6Synthesizer:               config.IPv6Synthesizer,
 		ResolveIP:                     resolveIP,
 		TrustedCACertificatesFilename: config.TrustedCACertificatesFilename,
@@ -1822,6 +1875,10 @@ func MakeDialParameters(
 			MeekCookieEncryptionPublicKey: serverEntry.MeekCookieEncryptionPublicKey,
 			MeekObfuscatedKey:             serverEntry.MeekObfuscatedKey,
 			MeekObfuscatorPaddingSeed:     dialParams.MeekObfuscatorPaddingSeed,
+			EnablePayloadPadding:          dialParams.MeekEnablePayloadPadding,
+			PayloadPaddingMinSize:         dialParams.MeekPayloadPaddingMinSize,
+			PayloadPaddingMaxSize:         dialParams.MeekPayloadPaddingMaxSize,
+			PayloadPaddingOmitProbability: dialParams.MeekPayloadPaddingOmitProbability,
 			NetworkLatencyMultiplier:      dialParams.NetworkLatencyMultiplier,
 			HTTPTransformerParameters:     dialParams.HTTPTransformerParameters,
 			AdditionalHeaders:             config.MeekAdditionalHeaders,
@@ -2213,8 +2270,9 @@ func selectFrontingParameters(
 func (dialParams *DialParameters) applyFrontedMeekDialOverride(
 	p parameters.ParametersAccessor) (bool, error) {
 
-	override, ok, err := p.FrontedMeekDialOverrides(
-		parameters.FrontedMeekDialOverrides).SelectCandidateParameters(
+	override, scanCandidate, scanStateKey, ok, err := selectFrontedMeekCDNScanOverride(
+		p,
+		dialParams.NetworkID,
 		dialParams.FrontingProviderID,
 		dialParams.MeekFrontingDialAddress,
 		dialParams.MeekFrontingHost,
@@ -2224,7 +2282,13 @@ func (dialParams *DialParameters) applyFrontedMeekDialOverride(
 	}
 	if !ok {
 		return false, nil
+	} else if scanCandidate != nil {
+		dialParams.FrontedMeekCDNScanCandidate = true
+		dialParams.frontedMeekCDNScanStateKey = scanStateKey
+		dialParams.frontedMeekCDNScanSelectedCandidate = *scanCandidate
 	}
+
+	originalMeekSNIServerName := dialParams.MeekSNIServerName
 
 	dialParams.MeekFrontingDialOverrideID = override.OverrideID
 	dialParams.MeekFrontingDialAddress = override.DialAddress
@@ -2243,7 +2307,8 @@ func (dialParams *DialParameters) applyFrontedMeekDialOverride(
 	dialParams.MeekVerifyPins = override.VerifyPins
 	dialParams.MeekTLSALPNProtocols = override.ALPNProtocols
 
-	if override.TLSProfile != "" {
+	if override.TLSProfile != "" &&
+		protocol.TunnelProtocolUsesMeekHTTPS(dialParams.TunnelProtocol) {
 		err = dialParams.applyFrontedMeekDialOverrideTLSProfile(
 			p, override.TLSProfile)
 		if err != nil {
@@ -2251,7 +2316,68 @@ func (dialParams *DialParameters) applyFrontedMeekDialOverride(
 		}
 	}
 
+	dialParams.applyFrontedMeekDialOverrideProtocolConstraints(originalMeekSNIServerName)
+
 	return true, nil
+}
+
+func (dialParams *DialParameters) applyFrontedMeekDialOverrideProtocolConstraints(
+	originalMeekSNIServerName string) {
+
+	switch protocol.TunnelProtocolMinusInproxy(dialParams.TunnelProtocol) {
+	case protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP_CDN:
+		// The HTTP fronted transport only consumes the dial address and Host
+		// header; TLS/SNI override fields do not apply.
+		dialParams.MeekSNIServerName = ""
+		dialParams.MeekVerifyServerNames = nil
+		dialParams.MeekVerifyServerName = ""
+		dialParams.MeekVerifyPins = nil
+		dialParams.MeekTLSALPNProtocols = nil
+		dialParams.SelectedTLSProfile = false
+		dialParams.TLSProfile = ""
+		dialParams.RandomizedTLSProfileSeed = nil
+		dialParams.MeekTransformedHostName = false
+
+	case protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH:
+		// QUIC meek currently supports overriding the dial address and SNI, but
+		// not custom certificate verification or TLS ClientHello parameters.
+		fallbackSNIServerName :=
+			dialParams.frontedMeekQUICCDNFallbackSNI(originalMeekSNIServerName)
+		if dialParams.MeekSNIServerName == "" {
+			dialParams.MeekTransformedHostName = false
+		} else if net.ParseIP(dialParams.MeekSNIServerName) != nil &&
+			fallbackSNIServerName != "" &&
+			net.ParseIP(fallbackSNIServerName) == nil {
+			// IP address values are omitted from SNI. When the CDN override
+			// points directly at an edge IP, preserve a routable fronting SNI.
+			dialParams.MeekSNIServerName = fallbackSNIServerName
+			dialParams.MeekTransformedHostName = true
+		}
+		dialParams.MeekVerifyServerNames = nil
+		dialParams.MeekVerifyServerName = ""
+		dialParams.MeekVerifyPins = nil
+		dialParams.MeekTLSALPNProtocols = nil
+		dialParams.SelectedTLSProfile = false
+		dialParams.TLSProfile = ""
+		dialParams.RandomizedTLSProfileSeed = nil
+	}
+}
+
+func (dialParams *DialParameters) frontedMeekQUICCDNFallbackSNI(
+	originalMeekSNIServerName string) string {
+
+	if originalMeekSNIServerName == "" {
+		return ""
+	}
+
+	// Prefer the actual selected fronting dial host over a randomized/
+	// transformed SNI; edge IP routing needs a routable CDN name.
+	if dialParams.MeekFrontingDialAddress != "" &&
+		net.ParseIP(dialParams.MeekFrontingDialAddress) == nil {
+		return dialParams.MeekFrontingDialAddress
+	}
+
+	return originalMeekSNIServerName
 }
 
 func (dialParams *DialParameters) frontedMeekCDNDialOverrideCandidateNumber() int {

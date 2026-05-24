@@ -22,7 +22,9 @@ package psiphon
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/subtle"
 	"crypto/tls"
+	"encoding/base64"
 	std_errors "errors"
 	"fmt"
 	"io"
@@ -226,6 +228,9 @@ func (proxy *HttpProxy) Close() {
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 func (proxy *HttpProxy) ServeHTTP(responseWriter http.ResponseWriter, request *http.Request) {
+	if !proxy.authorizeHTTPRequest(responseWriter, request) {
+		return
+	}
 	if request.Method == "CONNECT" {
 		conn := hijack(responseWriter)
 		if conn == nil {
@@ -244,6 +249,37 @@ func (proxy *HttpProxy) ServeHTTP(responseWriter http.ResponseWriter, request *h
 	} else {
 		proxy.urlProxyHandler(responseWriter, request)
 	}
+}
+
+func (proxy *HttpProxy) authorizeHTTPRequest(responseWriter http.ResponseWriter, request *http.Request) bool {
+	if !localProxyAuthRequiredForClient(proxy.config, request.RemoteAddr) {
+		return true
+	}
+	username, password, ok := parseProxyBasicAuth(request.Header.Get("Proxy-Authorization"))
+	if ok &&
+		subtle.ConstantTimeCompare([]byte(username), []byte(proxy.config.LocalProxyUsername)) == 1 &&
+		subtle.ConstantTimeCompare([]byte(password), []byte(proxy.config.LocalProxyPassword)) == 1 {
+		return true
+	}
+	responseWriter.Header().Set("Proxy-Authenticate", `Basic realm="Proxy"`)
+	http.Error(responseWriter, "Proxy authentication required", http.StatusProxyAuthRequired)
+	return false
+}
+
+func parseProxyBasicAuth(header string) (string, string, bool) {
+	const prefix = "Basic "
+	if len(header) < len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
+		return "", "", false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(header[len(prefix):]))
+	if err != nil {
+		return "", "", false
+	}
+	username, password, ok := strings.Cut(string(decoded), ":")
+	if !ok {
+		return "", "", false
+	}
+	return username, password, true
 }
 
 func (proxy *HttpProxy) httpConnectHandler(localConn net.Conn, target string) (err error) {

@@ -145,6 +145,7 @@ func StartTunnel(
 
 	// Will be closed when the tunnel has successfully connected
 	connectedSignal := make(chan struct{})
+	connectedSignalOnce := new(sync.Once)
 	// Will receive a value if an error occurs during the connection sequence
 	erroredCh := make(chan error, 1)
 
@@ -182,7 +183,9 @@ func StartTunnel(
 			} else if event.Type == "Tunnels" {
 				count := event.Data["count"].(float64)
 				if count > 0 {
-					close(connectedSignal)
+					connectedSignalOnce.Do(func() {
+						close(connectedSignal)
+					})
 				}
 			}
 
@@ -265,6 +268,12 @@ func StartTunnel(
 	if params.DisableLocalHTTPProxy != nil {
 		config.DisableLocalHTTPProxy = *params.DisableLocalHTTPProxy
 	} // else use the value in the config
+
+	// Future enhancement: rework ClientLibrary to have an asynchronous Start
+	// with support for callbacks, and then enable light tunnel mode.
+	if config.EnableLightProxy {
+		return nil, errors.TraceNew("EnableLightProxy is not supported")
+	}
 
 	// config.Commit must be called before calling config.SetParameters
 	// or attempting to connect.

@@ -1,4 +1,4 @@
-//go:build PSIPHON_ENABLE_INPROXY
+//go:build !PSIPHON_DISABLE_INPROXY
 
 /*
  * Copyright (c) 2023, Psiphon Inc.
@@ -36,25 +36,27 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Psiphon-Labs/covert-dtls/pkg/fingerprints"
+	"github.com/Psiphon-Labs/covert-dtls/pkg/mimicry"
+	"github.com/Psiphon-Labs/covert-dtls/pkg/randomize"
+	ice "github.com/Psiphon-Labs/pion-ice/v4"
+	webrtc "github.com/Psiphon-Labs/pion-webrtc/v4"
 	tls "github.com/Psiphon-Labs/psiphon-tls"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
-	inproxy_dtls "github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/inproxy/dtls"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/quic"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/stacktrace"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/values"
 	quic_go "github.com/Psiphon-Labs/quic-go"
 	"github.com/pion/datachannel"
-	"github.com/pion/dtls/v2"
-	"github.com/pion/ice/v2"
 	"github.com/pion/interceptor"
 	pion_logging "github.com/pion/logging"
 	"github.com/pion/rtp"
 	"github.com/pion/sdp/v3"
-	"github.com/pion/stun"
-	"github.com/pion/transport/v2"
-	"github.com/pion/webrtc/v3"
+	stun "github.com/pion/stun/v3"
+	transport "github.com/pion/transport/v4"
 	"github.com/wlynxg/anet"
 )
 
@@ -72,20 +74,6 @@ const (
 	mediaTrackRTPPacketOverhead   = 12 + 16 + 1 // RTP header, SRTP encryption, and Psiphon padding header
 	mediaTrackMaxRTPPayloadLength = mediaTrackMaxUDPPayloadLength - mediaTrackRTPPacketOverhead
 	mediaTrackMaxIDLength         = 256
-
-	// Psiphon uses a fork of github.com/pion/dtls/v2, selected with go mod
-	// replace, which has an idential API apart from dtls.IsPsiphon. If
-	// dtls.IsPsiphon is undefined, the build is not using the fork.
-	//
-	// Limitation: this doesn't check that the vendored code is exactly the
-	// same code as the fork.
-	assertDTLSFork = dtls.IsPsiphon
-
-	// Similarly, check for the fork of github.com/pion/ice/v2.
-	assertICEFork = ice.IsPsiphon
-
-	// Note that Psiphon also uses a fork of github.com/pion/webrtc/v3, but it
-	// has an API change which will cause builds to fail when not present.
 )
 
 // webRTCConn is a WebRTC connection between two peers, with a data channel
@@ -153,6 +141,10 @@ type webRTCConfig struct {
 	// Logger at a Debug log level.
 	EnableDebugLogging bool
 
+	// ExcludeInterfaceName specifies the interface name to omit from ICE
+	// interface enumeration.
+	ExcludeInterfaceName string
+
 	// WebRTCDialCoordinator specifies specific WebRTC dial strategies and
 	// settings; WebRTCDialCoordinator also facilities dial replay by
 	// receiving callbacks when individual dial steps succeed or fail.
@@ -162,8 +154,9 @@ type webRTCConfig struct {
 	// and sent to the proxy and used to drive obfuscation operations.
 	ClientRootObfuscationSecret ObfuscationSecret
 
-	// DoDTLSRandomization indicates whether to perform DTLS randomization.
-	DoDTLSRandomization bool
+	// DTLSFingerprint is the selected DTLS fingerprint name. New clients
+	// always select a fingerprint.
+	DTLSFingerprint string
 
 	// UseMediaStreams indicates whether to use WebRTC media streams to tunnel
 	// traffic. When false, a WebRTC data channel is used to tunnel traffic.
@@ -351,7 +344,10 @@ func newWebRTCConn(
 		config.EnableDebugLogging)
 
 	pionNetwork := newPionNetwork(
-		ctx, pionLoggerFactory.NewLogger("net"), config.WebRTCDialCoordinator)
+		ctx,
+		pionLoggerFactory.NewLogger("net"),
+		config.WebRTCDialCoordinator,
+		config.ExcludeInterfaceName)
 
 	udpMux := webrtc.NewICEUniversalUDPMux(
 		pionLoggerFactory.NewLogger("mux"), udpConn, TTL, pionNetwork)
@@ -407,29 +403,25 @@ func newWebRTCConn(
 	// Initialize data channel or media streams obfuscation
 
 	config.Logger.WithTraceFields(common.LogFields{
-		"dtls_randomization":           config.DoDTLSRandomization,
+		"dtls_fingerprint":             config.DTLSFingerprint,
 		"data_channel_traffic_shaping": config.TrafficShapingParameters != nil,
 		"use_media_streams":            config.UseMediaStreams,
 	}).Info("webrtc_obfuscation")
 
-	// Facilitate DTLS Client/ServerHello randomization. The client decides
-	// whether to do DTLS randomization and generates and the proxy receives
-	// ClientRootObfuscationSecret, so the client can orchestrate replay on
-	// both ends of the connection by reusing an obfuscation secret. Derive a
-	// secret specific to DTLS. SetDTLSSeed will futher derive a secure PRNG
-	// seed specific to either the client or proxy end of the connection
-	// (so each peer's randomization will be distinct).
+	// Facilitate DTLS Client/ServerHello randomization. The client generates
+	// ClientRootObfuscationSecret, which the proxy receives via the broker,
+	// so the client can orchestrate replay on both ends of the connection by
+	// reusing an obfuscation secret. Derive a secret specific to DTLS.
 	//
-	// To avoid forking many pion repos in order to pass the seed through to
-	// the DTLS implementation, SetDTLSSeed attaches the seed to the DTLS
-	// dial context.
+	// Each side independently selects its DTLS fingerprint profile. This
+	// intentional asymmetry produces a circumvention-friendly mix of profiles
+	// across the two peers, while determinism and replay are preserved by
+	// seeding both sides' PRNGs from the shared obfuscation secret.
 	//
-	// Either SetDTLSSeed or SetNoDTLSSeed should be set for each conn, as the
-	// pion/dtl fork treats no-seed as an error, as a check against the
-	// context value mechanism.
+	// Implementation uses stock pion/dtls v3 ClientHelloMessageHook and
+	// ServerHelloMessageHook on the SettingEngine.
 
-	var dtlsCtx context.Context
-	if config.DoDTLSRandomization {
+	if config.DTLSFingerprint != "" {
 
 		dtlsObfuscationSecret, err := deriveObfuscationSecret(
 			config.ClientRootObfuscationSecret, "in-proxy-DTLS-seed")
@@ -439,18 +431,26 @@ func newWebRTCConn(
 
 		baseSeed := prng.Seed(dtlsObfuscationSecret)
 
-		dtlsCtx, err = inproxy_dtls.SetDTLSSeed(ctx, &baseSeed, isOffer)
+		// Derive distinct sub-seeds for client hello and server hello,
+		// and for the offer vs answer side so each peer's randomization
+		// is distinct.
+		clientHelloSaltSuffix := "-client-hello-offer"
+		if !isOffer {
+			clientHelloSaltSuffix = "-client-hello-answer"
+		}
+		clientHelloSeed, err := prng.NewSaltedSeed(
+			&baseSeed, "in-proxy-DTLS"+clientHelloSaltSuffix)
+		if err != nil {
+			return nil, nil, nil, errors.Trace(err)
+		}
+		serverHelloSeed, err := prng.NewSaltedSeed(
+			&baseSeed, "in-proxy-DTLS-server-hello")
 		if err != nil {
 			return nil, nil, nil, errors.Trace(err)
 		}
 
-	} else {
-
-		dtlsCtx = inproxy_dtls.SetNoDTLSSeed(ctx)
+		setDTLSHooks(&settingEngine, config.DTLSFingerprint, clientHelloSeed, serverHelloSeed)
 	}
-	settingEngine.SetDTLSConnectContextMaker(func() (context.Context, func()) {
-		return context.WithCancel(dtlsCtx)
-	})
 
 	// Configure traffic shaping, which adds random padding and decoy messages
 	// to data channel message or media track packet flows.
@@ -901,6 +901,7 @@ func newWebRTCConn(
 				[]byte(peerSDP.SDP),
 				errorOnNoCandidates,
 				nil,
+				false,
 				common.GeoIPData{},
 				allowPrivateIPAddressCandidates,
 				filterPrivateIPAddressCandidates)
@@ -1112,6 +1113,7 @@ func (conn *webRTCConn) SetRemoteSDP(
 			[]byte(peerSDP.SDP),
 			errorOnNoCandidates,
 			nil,
+			false,
 			common.GeoIPData{},
 			allowPrivateIPAddressCandidates,
 			filterPrivateIPAddressCandidates)
@@ -1521,12 +1523,6 @@ func (conn *webRTCConn) GetMetrics() common.LogFields {
 
 	logFields.Add(conn.iceCandidatePairMetrics)
 
-	randomizeDTLS := "0"
-	if conn.config.DoDTLSRandomization {
-		randomizeDTLS = "1"
-	}
-	logFields["inproxy_webrtc_randomize_dtls"] = randomizeDTLS
-
 	useMediaStreams := "0"
 	if conn.config.UseMediaStreams {
 		useMediaStreams = "1"
@@ -1622,7 +1618,7 @@ func (conn *webRTCConn) onICEConnectionStateChange(state webrtc.ICEConnectionSta
 	}).Debug("ICE connection state changed")
 }
 
-func (conn *webRTCConn) onICEGatheringStateChange(state webrtc.ICEGathererState) {
+func (conn *webRTCConn) onICEGatheringStateChange(state webrtc.ICEGatheringState) {
 
 	conn.config.Logger.WithTraceFields(common.LogFields{
 		"state": state.String(),
@@ -2752,10 +2748,11 @@ func prepareSDPAddresses(
 		errorOnNoCandidates,
 		portMappingExternalAddr,
 		disableIPv6Candidates,
-		allowPrivateIPAddressCandidates,
-		false,
 		nil,
-		common.GeoIPData{})
+		false,
+		common.GeoIPData{},
+		allowPrivateIPAddressCandidates,
+		false)
 	return modifiedSDP, metrics, errors.Trace(err)
 }
 
@@ -2767,6 +2764,7 @@ func filterSDPAddresses(
 	encodedSDP []byte,
 	errorOnNoCandidates bool,
 	lookupGeoIP LookupGeoIP,
+	allowGeoIPMismatchCandidates bool,
 	expectedGeoIPData common.GeoIPData,
 	allowPrivateIPAddressCandidates bool,
 	filterPrivateIPAddressCandidates bool) ([]byte, *webRTCSDPMetrics, error) {
@@ -2776,19 +2774,23 @@ func filterSDPAddresses(
 		errorOnNoCandidates,
 		"",
 		false,
-		allowPrivateIPAddressCandidates,
-		filterPrivateIPAddressCandidates,
 		lookupGeoIP,
-		expectedGeoIPData)
+		allowGeoIPMismatchCandidates,
+		expectedGeoIPData,
+		allowPrivateIPAddressCandidates,
+		filterPrivateIPAddressCandidates)
 	return filteredSDP, metrics, errors.Trace(err)
 }
 
 // webRTCSDPMetrics are network capability metrics values for an SDP.
 type webRTCSDPMetrics struct {
-	iceCandidateTypes     []ICECandidateType
-	hasIPv6               bool
-	hasPrivateIP          bool
-	filteredICECandidates []string
+	iceCandidateCount      int
+	iceCandidateTypes      []ICECandidateType
+	hasIPv4                bool
+	hasIPv6                bool
+	hasPrivateIP           bool
+	filteredICECandidates  []string
+	allowedGeoIPMismatches int
 }
 
 // processSDPAddresses is based on snowflake/common/util.StripLocalAddresses
@@ -2833,10 +2835,17 @@ func processSDPAddresses(
 	errorOnNoCandidates bool,
 	portMappingExternalAddr string,
 	disableIPv6Candidates bool,
-	allowPrivateIPAddressCandidates bool,
-	filterPrivateIPAddressCandidates bool,
 	lookupGeoIP LookupGeoIP,
-	expectedGeoIPData common.GeoIPData) ([]byte, *webRTCSDPMetrics, error) {
+	allowGeoIPMismatchCandidates bool,
+	expectedGeoIPData common.GeoIPData,
+	allowPrivateIPAddressCandidates bool,
+	filterPrivateIPAddressCandidates bool) ([]byte, *webRTCSDPMetrics, error) {
+
+	if portMappingExternalAddr != "" && lookupGeoIP != nil {
+		// portMappingExternalAddr is used by prepareSDPAddresses and bypasses
+		// GeoIP checks. GeoIP checks are used by filterSDPAddresses.
+		return nil, nil, errors.TraceNew("unsupported")
+	}
 
 	var sessionDescription sdp.SessionDescription
 	err := sessionDescription.Unmarshal(encodedSDP)
@@ -2845,9 +2854,11 @@ func processSDPAddresses(
 	}
 
 	candidateTypes := map[ICECandidateType]bool{}
+	hasIPv4 := false
 	hasIPv6 := false
 	hasPrivateIP := false
 	filteredCandidateReasons := make(map[string]int)
+	allowedGeoIPMismatches := 0
 
 	var portMappingICECandidates []sdp.Attribute
 	if portMappingExternalAddr != "" {
@@ -2867,9 +2878,14 @@ func processSDPAddresses(
 		// Only IPv4 port mapping addresses are supported due to the
 		// NewCandidateHost limitation noted below. It is expected that port
 		// mappings will be IPv4, as NAT and IPv6 is not a typical combination.
+		//
+		// Skip the port mapping if the address doesn't appear to be a public,
+		// routable IP address. There is no allowPrivateIPAddressCandidates
+		// exception in this case, since the port mapping is not expected to
+		// be a common LAN address that could be used in personal pairing mode.
 
 		hostIP := net.ParseIP(host)
-		if hostIP != nil && hostIP.To4() != nil {
+		if hostIP != nil && hostIP.To4() != nil && !common.IsBogon(hostIP) {
 
 			for _, component := range []webrtc.ICEComponent{webrtc.ICEComponentRTP, webrtc.ICEComponentRTCP} {
 
@@ -2931,8 +2947,11 @@ func processSDPAddresses(
 					return nil, nil, errors.TraceNew("unexpected non-IP")
 				}
 
+				candidateIsIPv4 := false
 				candidateIsIPv6 := false
-				if candidateIP.To4() == nil {
+				if candidateIP.To4() != nil {
+					candidateIsIPv4 = true
+				} else {
 					if disableIPv6Candidates {
 						reason := fmt.Sprintf("disabled %s IPv6",
 							candidate.Type().String())
@@ -2989,6 +3008,9 @@ func processSDPAddresses(
 				// address, as there could be a mix of IPv4 and IPv6, as well
 				// as potentially different NAT paths.
 				//
+				// For IPv6, only the ASN must match as IPv6 GeoIP country
+				// data appears less reliable in practise.
+				//
 				// In some cases, legitimate clients and proxies may
 				// unintentionally submit candidates with mismatching GeoIP.
 				// This can occur, for example, when a STUN candidate is only
@@ -2998,28 +3020,48 @@ func processSDPAddresses(
 				// SDPs containing unexpected GeoIP candidates, they are
 				// instead stripped out and the resulting filtered SDP is
 				// used.
+				//
+				// In personal pairing mode, mismatching GeoIP candidates are
+				// allowed and peers are trusted to not misdirect each other
+				// to arbitrary destinations. This enables modes such as
+				// InproxyProxySplitUpstreamInterfaceName and broker
+				// tunneling that cannot relay the original client IP.
 
 				if lookupGeoIP != nil {
 					candidateGeoIPData := lookupGeoIP(candidate.Address())
 
-					if candidateGeoIPData.Country != expectedGeoIPData.Country ||
-						candidateGeoIPData.ASN != expectedGeoIPData.ASN {
+					mismatch := false
+					if candidateIsIPv6 {
+						mismatch = candidateGeoIPData.ASN != expectedGeoIPData.ASN
+					} else {
+						mismatch = candidateGeoIPData.Country != expectedGeoIPData.Country ||
+							candidateGeoIPData.ASN != expectedGeoIPData.ASN
+					}
 
-						version := "IPv4"
-						if candidateIsIPv6 {
-							version = "IPv6"
+					if mismatch {
+
+						if allowGeoIPMismatchCandidates {
+							allowedGeoIPMismatches += 1
+						} else {
+							version := "IPv4"
+							if candidateIsIPv6 {
+								version = "IPv6"
+							}
+							reason := fmt.Sprintf(
+								"unexpected GeoIP %s %s: %s/%s",
+								candidate.Type().String(),
+								version,
+								candidateGeoIPData.Country,
+								candidateGeoIPData.ASN)
+							filteredCandidateReasons[reason] += 1
+							continue
 						}
-						reason := fmt.Sprintf(
-							"unexpected GeoIP %s %s: %s/%s",
-							candidate.Type().String(),
-							version,
-							candidateGeoIPData.Country,
-							candidateGeoIPData.ASN)
-						filteredCandidateReasons[reason] += 1
-						continue
 					}
 				}
 
+				if candidateIsIPv4 {
+					hasIPv4 = true
+				}
 				if candidateIsIPv6 {
 					hasIPv6 = true
 				}
@@ -3058,8 +3100,11 @@ func processSDPAddresses(
 	}
 
 	metrics := &webRTCSDPMetrics{
-		hasIPv6:      hasIPv6,
-		hasPrivateIP: hasPrivateIP,
+		iceCandidateCount:      candidateCount,
+		hasIPv4:                hasIPv4,
+		hasIPv6:                hasIPv6,
+		hasPrivateIP:           hasPrivateIP,
+		allowedGeoIPMismatches: allowedGeoIPMismatches,
 	}
 	for candidateType := range candidateTypes {
 		metrics.iceCandidateTypes = append(metrics.iceCandidateTypes, candidateType)
@@ -3234,6 +3279,48 @@ func hasInterfaceForPrivateIPAddress(IP net.IP) bool {
 	return false
 }
 
+// setDTLSHooks configures ClientHello and ServerHello randomization hooks
+// on the pion SettingEngine based on the selected DTLS fingerprint.
+func setDTLSHooks(
+	settingEngine *webrtc.SettingEngine,
+	dtlsFingerprint string,
+	clientHelloSeed *prng.Seed,
+	serverHelloSeed *prng.Seed,
+) {
+	if protocol.DTLSFingerprintIsRandomized(dtlsFingerprint) || dtlsFingerprint == "" {
+		r := &randomize.RandomizedMessageClientHello{
+			Seed:       clientHelloSeed,
+			RandomALPN: true,
+		}
+		settingEngine.SetDTLSClientHelloMessageHook(r.Hook)
+	} else {
+		fpData, ok := getDTLSFingerprintData(dtlsFingerprint)
+		if ok {
+			m := &mimicry.MimickedClientHello{Seed: clientHelloSeed}
+			if err := m.LoadFingerprint(fpData); err == nil {
+				settingEngine.SetDTLSClientHelloMessageHook(m.Hook)
+			}
+		}
+	}
+
+	sh := &randomize.RandomizedMessageServerHello{Seed: serverHelloSeed}
+	settingEngine.SetDTLSServerHelloMessageHook(sh.Hook)
+}
+
+// getDTLSFingerprintData maps Psiphon DTLS fingerprint names to covert-dtls
+// fingerprint hex data. Psiphon fingerprint names are independent of the
+// underlying implementation.
+func getDTLSFingerprintData(dtlsFingerprint string) (fingerprints.ClientHelloFingerprint, bool) {
+	switch dtlsFingerprint {
+	case protocol.DTLS_FINGERPRINT_CHROME_138:
+		return fingerprints.Chrome_linux_138_0_7204_157, true
+	case protocol.DTLS_FINGERPRINT_FIREFOX_148:
+		return fingerprints.Firefox_linux_stable_148_0_2, true
+	default:
+		return "", false
+	}
+}
+
 // pionNetwork implements pion/transport.Net.
 //
 // Via the SettingsEngine, pion is configured to use a pionNetwork instance,
@@ -3246,17 +3333,20 @@ type pionNetwork struct {
 	dialCtx               context.Context
 	logger                pion_logging.LeveledLogger
 	webRTCDialCoordinator WebRTCDialCoordinator
+	excludeInterfaceName  string
 }
 
 func newPionNetwork(
 	dialCtx context.Context,
 	logger pion_logging.LeveledLogger,
-	webRTCDialCoordinator WebRTCDialCoordinator) *pionNetwork {
+	webRTCDialCoordinator WebRTCDialCoordinator,
+	excludeInterfaceName string) *pionNetwork {
 
 	return &pionNetwork{
 		dialCtx:               dialCtx,
 		logger:                logger,
 		webRTCDialCoordinator: webRTCDialCoordinator,
+		excludeInterfaceName:  excludeInterfaceName,
 	}
 }
 
@@ -3318,6 +3408,10 @@ func (p *pionNetwork) Interfaces() ([]*transport.Interface, error) {
 	}
 
 	for _, netInterface := range netInterfaces {
+		if p.excludeInterfaceName != "" && netInterface.Name == p.excludeInterfaceName {
+			continue
+		}
+
 		// Note: don't exclude interfaces with the net.FlagPointToPoint flag,
 		// which is set for certain mobile networks
 		if (netInterface.Flags&net.FlagUp == 0) ||
@@ -3462,6 +3556,11 @@ func (p *pionNetwork) InterfaceByName(name string) (*transport.Interface, error)
 
 func (p *pionNetwork) CreateDialer(dialer *net.Dialer) transport.Dialer {
 	return &pionNetworkDialer{pionNetwork: p}
+}
+
+func (p *pionNetwork) CreateListenConfig(listenerConfig *net.ListenConfig) transport.ListenConfig {
+	p.logger.Errorf("unexpected pionNetwork.CreateListenConfig call from %s", stacktrace.GetParentFunctionName())
+	return nil
 }
 
 type pionNetworkDialer struct {

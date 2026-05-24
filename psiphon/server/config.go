@@ -157,8 +157,10 @@ type Config struct {
 	// protocols include:
 	// "SSH", "OSSH", "TLS-OSSH", "UNFRONTED-MEEK-OSSH", "UNFRONTED-MEEK-HTTPS-OSSH",
 	// "UNFRONTED-MEEK-SESSION-TICKET-OSSH", "FRONTED-MEEK-OSSH",
-	// "FRONTED-MEEK-QUIC-OSSH", "FRONTED-MEEK-HTTP-OSSH", "QUIC-OSSH",
-	// "TAPDANCE-OSSH", "CONJURE-OSSH", and "SHADOWSOCKS-OSSH".
+	// "FRONTED-MEEK-CDN-OSSH", "FRONTED-MEEK-QUIC-OSSH",
+	// "FRONTED-MEEK-CDN-QUIC-OSSH", "FRONTED-MEEK-HTTP-OSSH",
+	// "FRONTED-MEEK-CDN-HTTP-OSSH", "QUIC-OSSH", "TAPDANCE-OSSH",
+	// "CONJURE-OSSH", and "SHADOWSOCKS-OSSH".
 	TunnelProtocolPorts map[string]int `json:",omitempty"`
 
 	// TunnelProtocolPassthroughAddresses specifies passthrough addresses to be
@@ -244,6 +246,12 @@ type Config struct {
 	// MeekRequiredHeaders is a list of HTTP header names and values that must
 	// appear in requests. This is used to defend against abuse.
 	MeekRequiredHeaders map[string]string `json:",omitempty"`
+
+	// MeekRequiredHeadersNonStrict enables the non-strict mode for meek
+	// required headers, allowing connections without the headers. In this
+	// mode, only the functionality that depends on required headers is
+	// disabled.
+	MeekRequiredHeadersNonStrict bool `json:",omitempty"`
 
 	// MeekServerCertificate specifies an optional certificate to use for meek
 	// servers, in place of the default, randomly generate certificate. When
@@ -581,6 +589,25 @@ type Config struct {
 	// DSL relaying.
 	DSLRelayHostKeyFilename string `json:",omitempty"`
 
+	// ProxyProtocolHeaderMACKeys are MAC keys used to authenticate HAProxy
+	// PROXY protocol headers that are optionally added to configured port
+	// forwards. The destination addresses targeted for PROXY header
+	// injection are configured in the
+	// ProxyProtocolHeaderTargetDestinationAddresses tactics parameter.
+	//
+	// These PROXY protocol headers are intended as an authenticated
+	// alternative for Psiphon use cases which previously added PROXY
+	// headers on the client side.
+	//
+	// For the target destinations, any PROXY protocol headers sent by clients
+	// are detected and replaced. This scheme is compatible only with
+	// client-first network protocol port forwards.
+	//
+	// There is one MAC key per configured sponsor ID, and each key is a
+	// base64-encoded concatenation of the key ID and key value
+	// (see makeProxyProtocolHeader).
+	ProxyProtocolHeaderMACKeys map[string]string `json:",omitempty"`
+
 	sshBeginHandshakeTimeout                       time.Duration
 	sshHandshakeTimeout                            time.Duration
 	peakUpstreamFailureRateMinimumSampleSize       int
@@ -595,6 +622,7 @@ type Config struct {
 	runningProtocols                               []string
 	runningOnlyInproxyBroker                       bool
 	destinationBytesPeriod                         time.Duration
+	proxyProtocolHeaderMACKeys                     map[string][]byte
 }
 
 // GetLogFileReopenConfig gets the reopen retries, and create/mode inputs for
@@ -800,7 +828,7 @@ func LoadConfig(configJSON []byte) (*Config, error) {
 
 		if protocol.TunnelProtocolUsesInproxy(tunnelProtocol) && !inproxy.Enabled() {
 			// Note that, technically, it may be possible to allow this case,
-			// since PSIPHON_ENABLE_INPROXY is currently required only for
+			// since !PSIPHON_DISABLE_INPROXY is currently required only for
 			// client/proxy-side WebRTC functionality, although that could change.
 			return nil, errors.TraceNew("inproxy implementation is not enabled")
 		}
@@ -843,13 +871,23 @@ func LoadConfig(configJSON []byte) (*Config, error) {
 		// edge-to-server hop, so it must be enabled or else this
 		// configuration will not work. There is no FRONTED QUIC listener at
 		// all; see TunnelServer.Run.
-		if protocol.TunnelProtocolUsesFrontedMeek(tunnelProtocol) {
-			_, ok := config.TunnelProtocolPorts[protocol.TUNNEL_PROTOCOL_FRONTED_MEEK]
+		//
+		// There is an equivalent constraint for INPROXY-WEBRTC-FRONTED
+		// variants: for INPROXY FRONTED QUIC and HTTP, the INPROXY FRONTED
+		// HTTPS listener is always used.
+
+		if protocol.TunnelProtocolUsesFrontedMeekNonHTTPS(tunnelProtocol) {
+			requiredTunnelProtocol := protocol.TUNNEL_PROTOCOL_FRONTED_MEEK
+			if protocol.TunnelProtocolUsesInproxy(tunnelProtocol) {
+				requiredTunnelProtocol = protocol.TunnelProtocolPlusInproxyWebRTC(
+					requiredTunnelProtocol)
+			}
+			_, ok := config.TunnelProtocolPorts[requiredTunnelProtocol]
 			if !ok {
 				return nil, errors.Tracef(
 					"Tunnel protocol %s requires %s to be enabled",
 					tunnelProtocol,
-					protocol.TUNNEL_PROTOCOL_FRONTED_MEEK)
+					requiredTunnelProtocol)
 			}
 		}
 
@@ -966,6 +1004,27 @@ func LoadConfig(configJSON []byte) (*Config, error) {
 	config.destinationBytesPeriod = DEFAULT_DESTINATION_BYTES_PERIOD
 	if config.DestinationBytesPeriodSeconds != nil {
 		config.destinationBytesPeriod = time.Duration(*config.DestinationBytesPeriodSeconds) * time.Second
+	}
+
+	if len(config.ProxyProtocolHeaderMACKeys) > 0 {
+
+		// Client tunnel handlers will reference the proxyProtocolHeaderMACKeys
+		// slices directly and assumes this memory is not mutated.
+
+		config.proxyProtocolHeaderMACKeys = make(map[string][]byte)
+		for sponsorID, base64Value := range config.ProxyProtocolHeaderMACKeys {
+			if !isSponsorID(sponsorID) {
+				return nil, errors.TraceNew("invalid ProxyProtocolHeaderMACKeys sponsor ID")
+			}
+			value, err := base64.StdEncoding.DecodeString(base64Value)
+			if err != nil {
+				return nil, errors.Tracef("invalid ProxyProtocolHeaderMACKeys value: %v", err)
+			}
+			if len(value) != proxyProtocolHeaderKeyIDSize+proxyProtocolHeaderMACKeySize {
+				return nil, errors.TraceNew("unexpected ProxyProtocolHeaderMACKeys value size")
+			}
+			config.proxyProtocolHeaderMACKeys[sponsorID] = value
+		}
 	}
 
 	return &config, nil

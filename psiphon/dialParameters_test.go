@@ -49,6 +49,10 @@ func TestDialParametersAndReplay(t *testing.T) {
 	}
 }
 
+func TestFrontedMeekQUICCDNDialParametersAndReplay(t *testing.T) {
+	runDialParametersAndReplay(t, protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH)
+}
+
 var testNetworkID = prng.HexString(8)
 
 type testNetworkGetter struct {
@@ -61,6 +65,7 @@ func (t *testNetworkGetter) GetNetworkID() string {
 func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 	t.Logf("Test %s...", tunnelProtocol)
+	ctx := context.Background()
 
 	testDataDirName, err := ioutil.TempDir("", "psiphon-dial-parameters-test")
 	if err != nil {
@@ -142,6 +147,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 				DialAddresses:           []string{"cdn.example.org"},
 				SNIServerName:           "cdn.example.org",
 				VerifyServerNames:       []string{"cdn.example.org"},
+				VerifyPins:              []string{"pin"},
 				ALPNProtocols:           []string{"http/1.1"},
 			},
 		}
@@ -153,7 +159,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		t.Fatalf("SetParameters failed: %s", err)
 	}
 
-	resolver := NewResolver(clientConfig, true)
+	resolver := NewResolver(clientConfig, clientConfig.deviceBinder())
 	defer resolver.Stop()
 	clientConfig.SetResolver(resolver)
 
@@ -169,7 +175,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		return replayProtocol == tunnelProtocol
 	}
 
-	selectProtocol := func(serverEntry *protocol.ServerEntry) (string, bool) {
+	selectProtocol := func(serverEntry *protocol.ServerEntry, _ string) (string, bool) {
 		return tunnelProtocol, true
 	}
 
@@ -269,6 +275,46 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 			if dialParams.QUICDialSNIAddress == "" {
 				t.Fatalf("missing QUIC SNI field")
 			}
+		}
+	}
+
+	if tunnelProtocol == protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH {
+		if dialParams.MeekFrontingDialOverrideID != "test-cdn" {
+			t.Fatalf("missing CDN dial override ID")
+		}
+		if dialParams.MeekFrontingDialAddress != "cdn.example.org" {
+			t.Fatalf("unexpected CDN dial address: %s", dialParams.MeekFrontingDialAddress)
+		}
+		if dialParams.MeekDialAddress != "cdn.example.org:443" {
+			t.Fatalf("unexpected CDN meek dial address: %s", dialParams.MeekDialAddress)
+		}
+		if dialParams.MeekSNIServerName != "cdn.example.org" {
+			t.Fatalf("unexpected CDN QUIC SNI: %s", dialParams.MeekSNIServerName)
+		}
+		if len(dialParams.MeekVerifyServerNames) != 0 ||
+			dialParams.MeekVerifyServerName != "" ||
+			len(dialParams.MeekVerifyPins) != 0 ||
+			len(dialParams.MeekTLSALPNProtocols) != 0 {
+			t.Fatalf("QUIC CDN retained unsupported TLS verification override fields")
+		}
+		if dialParams.SelectedTLSProfile ||
+			dialParams.TLSProfile != "" ||
+			dialParams.RandomizedTLSProfileSeed != nil {
+			t.Fatalf("QUIC CDN retained unsupported TLS profile fields")
+		}
+		if dialParams.meekConfig == nil {
+			t.Fatalf("missing CDN QUIC meek config")
+		}
+		if !dialParams.meekConfig.UseQUIC ||
+			dialParams.meekConfig.UseHTTPS ||
+			dialParams.meekConfig.DialAddress != dialParams.MeekDialAddress ||
+			dialParams.meekConfig.SNIServerName != dialParams.MeekSNIServerName ||
+			dialParams.meekConfig.ClientTunnelProtocol != protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_OBFUSCATED_SSH ||
+			len(dialParams.meekConfig.VerifyServerNames) != 0 ||
+			len(dialParams.meekConfig.VerifyPins) != 0 ||
+			len(dialParams.meekConfig.ALPNProtocols) != 0 ||
+			dialParams.meekConfig.TLSProfile != "" {
+			t.Fatalf("unexpected CDN QUIC meek config")
 		}
 	}
 
@@ -815,9 +861,16 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 	networkID := clientConfig.GetNetworkID()
 
+	prioritizeReason := fmt.Sprintf("prioritize-reason-%s", prng.HexString(8))
+	prioritizeTunnelProtocol := tunnelProtocol
+
 	err = datastoreUpdate(func(tx *datastoreTx) error {
 		return dslPrioritizeDialServerEntry(
-			tx, networkID, []byte(serverEntries[1].IpAddress))
+			tx,
+			networkID,
+			[]byte(serverEntries[1].IpAddress),
+			prioritizeReason,
+			prioritizeTunnelProtocol)
 	})
 	if err != nil {
 		t.Fatalf("dslPrioritizeDialServerEntry failed: %s", err)
@@ -829,8 +882,14 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		t.Fatalf("MakeDialParameters failed: %s", err)
 	}
 
-	if !dialParams.DSLPendingPrioritizeDialTimestamp.IsZero() || !dialParams.DSLPrioritizedDial {
+	if !dialParams.DSLPendingPrioritizeDialTimestamp.IsZero() ||
+		!dialParams.DSLPrioritizedDial ||
+		dialParams.DSLPrioritizedDialReason != prioritizeReason ||
+		dialParams.DSLPrioritizedTunnelProtocol != prioritizeTunnelProtocol {
 		t.Fatalf("unexpected DSL prioritize state")
+	}
+	if dialParams.TunnelProtocol != prioritizeTunnelProtocol {
+		t.Fatalf("unexpected prioritized tunnel protocol")
 	}
 
 	if dialParams.IsReplay {
@@ -845,7 +904,10 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		t.Fatalf("MakeDialParameters failed: %s", err)
 	}
 
-	if !dialParams.DSLPendingPrioritizeDialTimestamp.IsZero() || !dialParams.DSLPrioritizedDial {
+	if !dialParams.DSLPendingPrioritizeDialTimestamp.IsZero() ||
+		!dialParams.DSLPrioritizedDial ||
+		dialParams.DSLPrioritizedDialReason != prioritizeReason ||
+		dialParams.DSLPrioritizedTunnelProtocol != prioritizeTunnelProtocol {
 		t.Fatalf("unexpected DSL prioritize state")
 	}
 
@@ -857,7 +919,11 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 	err = datastoreUpdate(func(tx *datastoreTx) error {
 		return dslPrioritizeDialServerEntry(
-			tx, networkID, []byte(serverEntries[1].IpAddress))
+			tx,
+			networkID,
+			[]byte(serverEntries[1].IpAddress),
+			prioritizeReason,
+			prioritizeTunnelProtocol)
 	})
 	if err != nil {
 		t.Fatalf("dslPrioritizeDialServerEntry failed: %s", err)
@@ -869,7 +935,10 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		t.Fatalf("MakeDialParameters failed: %s", err)
 	}
 
-	if !dialParams.DSLPendingPrioritizeDialTimestamp.IsZero() || !dialParams.DSLPrioritizedDial {
+	if !dialParams.DSLPendingPrioritizeDialTimestamp.IsZero() ||
+		!dialParams.DSLPrioritizedDial ||
+		dialParams.DSLPrioritizedDialReason != prioritizeReason ||
+		dialParams.DSLPrioritizedTunnelProtocol != prioritizeTunnelProtocol {
 		t.Fatalf("unexpected DSL prioritize state")
 	}
 
@@ -888,6 +957,8 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 	expiredPlaceholder := &DialParameters{
 		DSLPendingPrioritizeDialTimestamp: time.Now().Add(-24 * time.Hour),
+		DSLPrioritizedDialReason:          prioritizeReason,
+		DSLPrioritizedTunnelProtocol:      prioritizeTunnelProtocol,
 	}
 	err = SetDialParameters(serverEntries[2].IpAddress, networkID, expiredPlaceholder)
 	if err != nil {
@@ -901,7 +972,9 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 	}
 
 	// DSLPrioritizedDial is true even for expired placeholders...
-	if !dialParams.DSLPrioritizedDial {
+	if !dialParams.DSLPrioritizedDial ||
+		dialParams.DSLPrioritizedDialReason != prioritizeReason ||
+		dialParams.DSLPrioritizedTunnelProtocol != prioritizeTunnelProtocol {
 		t.Fatalf("unexpected DSL prioritize state")
 	}
 
@@ -916,7 +989,11 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 	err = datastoreUpdate(func(tx *datastoreTx) error {
 		return dslPrioritizeDialServerEntry(
-			tx, networkID, []byte(serverEntries[3].IpAddress))
+			tx,
+			networkID,
+			[]byte(serverEntries[3].IpAddress),
+			prioritizeReason,
+			prioritizeTunnelProtocol)
 	})
 	if err != nil {
 		t.Fatalf("dslPrioritizeDialServerEntry failed: %s", err)
@@ -928,7 +1005,9 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		t.Fatalf("MakeDialParameters failed: %s", err)
 	}
 
-	if !dialParams.DSLPrioritizedDial {
+	if !dialParams.DSLPrioritizedDial ||
+		dialParams.DSLPrioritizedDialReason != prioritizeReason ||
+		dialParams.DSLPrioritizedTunnelProtocol != prioritizeTunnelProtocol {
 		t.Fatalf("unexpected DSL prioritize state")
 	}
 
@@ -958,7 +1037,11 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 	err = datastoreUpdate(func(tx *datastoreTx) error {
 		return dslPrioritizeDialServerEntry(
-			tx, networkID, []byte(serverEntries[3].IpAddress))
+			tx,
+			networkID,
+			[]byte(serverEntries[3].IpAddress),
+			prioritizeReason,
+			prioritizeTunnelProtocol)
 	})
 	if err != nil {
 		t.Fatalf("dslPrioritizeDialServerEntry failed: %s", err)
@@ -978,6 +1061,40 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 	}
 	if storedDialParams == nil || storedDialParams.DSLPendingPrioritizeDialTimestamp.IsZero() {
 		t.Fatalf("expected DSL prioritize placeholder")
+	}
+
+	// Test: DSLPendingPrioritizeDial falls back to a different tunnel
+	// protocol when the prioritized tunnel protocol is unavailable.
+
+	unavailablePrioritizeTunnelProtocol := protocol.SupportedTunnelProtocols[0]
+	if unavailablePrioritizeTunnelProtocol == tunnelProtocol {
+		unavailablePrioritizeTunnelProtocol = protocol.SupportedTunnelProtocols[1]
+	}
+	err = datastoreUpdate(func(tx *datastoreTx) error {
+		return dslPrioritizeDialServerEntry(
+			tx,
+			networkID,
+			[]byte(serverEntries[4].IpAddress),
+			prioritizeReason,
+			unavailablePrioritizeTunnelProtocol)
+	})
+	if err != nil {
+		t.Fatalf("dslPrioritizeDialServerEntry failed: %s", err)
+	}
+
+	dialParams, err = MakeDialParameters(
+		clientConfig, steeringIPCache, nil, nil, nil, canReplay, selectProtocol, serverEntries[4], nil, nil, false, 0, 0)
+	if err != nil {
+		t.Fatalf("MakeDialParameters failed: %s", err)
+	}
+
+	if !dialParams.DSLPrioritizedDial ||
+		dialParams.DSLPrioritizedDialReason != prioritizeReason ||
+		dialParams.DSLPrioritizedTunnelProtocol != unavailablePrioritizeTunnelProtocol {
+		t.Fatalf("unexpected DSL prioritize state")
+	}
+	if dialParams.TunnelProtocol == unavailablePrioritizeTunnelProtocol {
+		t.Fatalf("unexpected use of unavailable prioritized tunnel protocol")
 	}
 
 	// Test: iterator shuffles
@@ -1025,7 +1142,11 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 			err := datastoreUpdate(func(tx *datastoreTx) error {
 				return dslPrioritizeDialServerEntry(
-					tx, networkID, []byte(serverEntry.IpAddress))
+					tx,
+					networkID,
+					[]byte(serverEntry.IpAddress),
+					prioritizeReason,
+					prioritizeTunnelProtocol)
 			})
 			if err != nil {
 				t.Fatalf("dslPrioritizeDialServerEntry failed: %s", err)
@@ -1036,7 +1157,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 	for i := 0; i < 5; i++ {
 
-		hasAffinity, iterator, err := NewServerEntryIterator(clientConfig)
+		hasAffinity, iterator, err := NewServerEntryIterator(ctx, clientConfig)
 		if err != nil {
 			t.Fatalf("NewServerEntryIterator failed: %s", err)
 		}
@@ -1049,7 +1170,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 		for j := 0; j < 20; j++ {
 
-			serverEntry, err := iterator.Next()
+			serverEntry, err := iterator.Next(ctx)
 			if err != nil {
 				t.Fatalf("ServerEntryIterator.Next failed: %s", err)
 			}
@@ -1065,14 +1186,14 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 			}
 		}
 
-		iterator.Reset()
+		iterator.Reset(ctx)
 
 		// Test: subsequent shuffles should not move the replay/DSL-prioritize candidates candidates
 
 		allMoveToFront := true
 		for j := 0; j < 20; j++ {
 
-			serverEntry, err := iterator.Next()
+			serverEntry, err := iterator.Next(ctx)
 			if err != nil {
 				t.Fatalf("ServerEntryIterator.Next failed: %s", err)
 			}
@@ -1103,7 +1224,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 			t.Fatalf("SetParameters failed: %s", err)
 		}
 
-		hasAffinity, iterator, err = NewServerEntryIterator(clientConfig)
+		hasAffinity, iterator, err = NewServerEntryIterator(ctx, clientConfig)
 		if err != nil {
 			t.Fatalf("NewServerEntryIterator failed: %s", err)
 		}
@@ -1114,7 +1235,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 
 		for j := 0; j < 5; j++ {
 
-			serverEntry, err := iterator.Next()
+			serverEntry, err := iterator.Next(ctx)
 			if err != nil {
 				t.Fatalf("ServerEntryIterator.Next failed: %s", err)
 			}
@@ -1133,7 +1254,7 @@ func runDialParametersAndReplay(t *testing.T, tunnelProtocol string) {
 		allMoveToFront = true
 		for j := 5; j < 20; j++ {
 
-			serverEntry, err := iterator.Next()
+			serverEntry, err := iterator.Next(ctx)
 			if err != nil {
 				t.Fatalf("ServerEntryIterator.Next failed: %s", err)
 			}
@@ -1221,8 +1342,8 @@ func TestLimitTunnelDialPortNumbers(t *testing.T) {
 			clientConfig.GetParameters().Get().TunnelProtocolPortLists(parameters.LimitTunnelDialPortNumbers)),
 	}
 
-	selectProtocol := func(serverEntry *protocol.ServerEntry) (string, bool) {
-		protocol, _, ok := constraints.selectProtocol(0, false, false, serverEntry)
+	selectProtocol := func(serverEntry *protocol.ServerEntry, prioritizeTunnelProtocol string) (string, bool) {
+		protocol, _, ok := constraints.selectProtocol(0, false, false, prioritizeTunnelProtocol, serverEntry)
 		return protocol, ok
 	}
 
@@ -1242,7 +1363,7 @@ func TestLimitTunnelDialPortNumbers(t *testing.T) {
 
 		for _, serverEntry := range serverEntries {
 
-			selectedProtocol, ok := selectProtocol(serverEntry)
+			selectedProtocol, ok := selectProtocol(serverEntry, "")
 
 			if ok {
 
@@ -1506,6 +1627,115 @@ func TestFrontedMeekCDNDialOverrideCandidateNumber(t *testing.T) {
 			if candidateNumber != testCase.expectedCandidateNum {
 				t.Fatalf("got %d, expected %d",
 					candidateNumber, testCase.expectedCandidateNum)
+			}
+		})
+	}
+}
+
+func TestFrontedMeekCDNDialOverrideProtocolConstraints(t *testing.T) {
+
+	testCases := []struct {
+		name                      string
+		tunnelProtocol            string
+		inputSNI                  string
+		originalSNI               string
+		frontingDialAddress       string
+		expectedSNI               string
+		expectTransformedHostName bool
+		expectVerifyServerNames   bool
+		expectVerifyPins          bool
+		expectALPNProtocols       bool
+		expectSelectedTLSProfile  bool
+	}{
+		{
+			name:                      "HTTPS CDN keeps TLS override fields",
+			tunnelProtocol:            protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_CDN,
+			inputSNI:                  "cdn.example.org",
+			expectedSNI:               "cdn.example.org",
+			expectTransformedHostName: true,
+			expectVerifyServerNames:   true,
+			expectVerifyPins:          true,
+			expectALPNProtocols:       true,
+			expectSelectedTLSProfile:  true,
+		},
+		{
+			name:           "HTTP CDN drops TLS-only override fields",
+			tunnelProtocol: protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP_CDN,
+			inputSNI:       "cdn.example.org",
+		},
+		{
+			name:                      "QUIC CDN keeps SNI but drops unsupported verification fields",
+			tunnelProtocol:            protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH,
+			inputSNI:                  "cdn.example.org",
+			originalSNI:               "original.example.org",
+			expectedSNI:               "cdn.example.org",
+			expectTransformedHostName: true,
+		},
+		{
+			name:           "QUIC CDN keeps disabled SNI disabled",
+			tunnelProtocol: protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH,
+			originalSNI:    "original.example.org",
+		},
+		{
+			name:                      "QUIC CDN preserves original SNI for IP edge overrides",
+			tunnelProtocol:            protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH,
+			inputSNI:                  "192.0.2.1",
+			originalSNI:               "a1234.g.akamai.net",
+			expectedSNI:               "a1234.g.akamai.net",
+			expectTransformedHostName: true,
+		},
+		{
+			name:                      "QUIC CDN prefers fronting dial address for IP edge overrides",
+			tunnelProtocol:            protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_QUIC_CDN_OSSH,
+			inputSNI:                  "192.0.2.1",
+			originalSNI:               "transformed.example.org",
+			frontingDialAddress:       "a1234.g.akamai.net",
+			expectedSNI:               "a1234.g.akamai.net",
+			expectTransformedHostName: true,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			dialParams := &DialParameters{
+				TunnelProtocol:           testCase.tunnelProtocol,
+				MeekSNIServerName:        testCase.inputSNI,
+				MeekFrontingDialAddress:  testCase.frontingDialAddress,
+				MeekVerifyServerName:     "cdn.example.org",
+				MeekVerifyServerNames:    []string{"cdn.example.org"},
+				MeekVerifyPins:           []string{"pin"},
+				MeekTLSALPNProtocols:     []string{"h2", "http/1.1"},
+				SelectedTLSProfile:       true,
+				TLSProfile:               protocol.TLS_PROFILE_CHROME_83,
+				RandomizedTLSProfileSeed: new(prng.Seed),
+				MeekTransformedHostName:  true,
+			}
+
+			dialParams.applyFrontedMeekDialOverrideProtocolConstraints(testCase.originalSNI)
+
+			if dialParams.MeekSNIServerName != testCase.expectedSNI {
+				t.Fatalf("unexpected SNI state: %s", dialParams.MeekSNIServerName)
+			}
+			if dialParams.MeekTransformedHostName != testCase.expectTransformedHostName {
+				t.Fatalf("unexpected transformed host name state")
+			}
+			if (len(dialParams.MeekVerifyServerNames) > 0) != testCase.expectVerifyServerNames {
+				t.Fatalf("unexpected verify server names state")
+			}
+			if (len(dialParams.MeekVerifyPins) > 0) != testCase.expectVerifyPins {
+				t.Fatalf("unexpected verify pins state")
+			}
+			if (len(dialParams.MeekTLSALPNProtocols) > 0) != testCase.expectALPNProtocols {
+				t.Fatalf("unexpected ALPN protocols state")
+			}
+			if dialParams.SelectedTLSProfile != testCase.expectSelectedTLSProfile {
+				t.Fatalf("unexpected selected TLS profile state")
+			}
+			if (dialParams.TLSProfile != "") != testCase.expectSelectedTLSProfile {
+				t.Fatalf("unexpected TLS profile state")
+			}
+			if (dialParams.RandomizedTLSProfileSeed != nil) != testCase.expectSelectedTLSProfile {
+				t.Fatalf("unexpected randomized TLS profile seed state")
 			}
 		})
 	}

@@ -49,6 +49,7 @@ type testConfig struct {
 	isTunneled         bool
 	expectFailure      bool
 	cacheServerEntries bool
+	cacheOSLFileSpecs  bool
 }
 
 func TestDSLs(t *testing.T) {
@@ -102,6 +103,23 @@ func TestDSLs(t *testing.T) {
 			interruptDownloads: true,
 			enableRetries:      true,
 			cacheServerEntries: true,
+		},
+		{
+			name: "cache OSL file specs",
+
+			requireOSLKeys:     true,
+			interruptDownloads: true,
+			enableRetries:      true,
+			cacheOSLFileSpecs:  true,
+		},
+		{
+			name: "cache both",
+
+			requireOSLKeys:     true,
+			interruptDownloads: true,
+			enableRetries:      true,
+			cacheServerEntries: true,
+			cacheOSLFileSpecs:  true,
 		},
 	}
 
@@ -175,10 +193,12 @@ func testDSLs(testConfig *testConfig) error {
 
 	expectValidMetric := false
 	metricsValidator := func(metric string, fields common.LogFields) bool { return false }
-	if testConfig.cacheServerEntries {
+	if testConfig.cacheServerEntries || testConfig.cacheOSLFileSpecs {
 		expectValidMetric = true
 		metricsValidator = func(metric string, fields common.LogFields) bool {
-			return metric == "dsl_relay_get_server_entries"
+			// TODO: in "both" test case, check that both events are logged
+			return (testConfig.cacheServerEntries && metric == "dsl_relay_get_server_entries") ||
+				(testConfig.cacheOSLFileSpecs && metric == "dsl_relay_get_osl_file_specs")
 		}
 	}
 
@@ -219,9 +239,24 @@ func testDSLs(testConfig *testConfig) error {
 		return errors.Trace(err)
 	}
 
+	serverEntryCacheTTL := defaultServerEntryCacheTTL
+	serverEntryCacheMaxSize := defaultServerEntryCacheMaxSize
+	oslFileSpecCacheTTL := defaultOSLFileSpecCacheTTL
+	oslFileSpecCacheMaxSize := defaultOSLFileSpecCacheMaxSize
+
 	if !testConfig.cacheServerEntries {
-		relay.SetCacheParameters(0, 0)
+		serverEntryCacheTTL = 0
+		serverEntryCacheMaxSize = 0
 	}
+	if !testConfig.cacheOSLFileSpecs {
+		oslFileSpecCacheTTL = 0
+		oslFileSpecCacheMaxSize = 0
+	}
+	relay.SetCacheParameters(
+		serverEntryCacheTTL,
+		serverEntryCacheMaxSize,
+		oslFileSpecCacheTTL,
+		oslFileSpecCacheMaxSize)
 
 	// Initialize client fetcher
 
@@ -286,10 +321,17 @@ func testDSLs(testConfig *testConfig) error {
 	datastoreHasServerEntryWithCheck := func(
 		tag ServerEntryTag,
 		version int,
-		prioritizeDial bool) bool {
+		prioritizeDial bool,
+		prioritizeReason string,
+		prioritizeTunnelProtocol string) bool {
 
-		_, expectedPrioritizeDial, err := backend.GetServerEntryProperties(tag.String())
-		if err != nil || prioritizeDial != expectedPrioritizeDial {
+		_, expectedPrioritizeDial, expectedPrioritizeReason,
+			expectedPrioritizeTunnelProtocol, err :=
+			backend.GetServerEntryProperties(tag.String())
+		if err != nil ||
+			prioritizeDial != expectedPrioritizeDial ||
+			prioritizeReason != expectedPrioritizeReason ||
+			prioritizeTunnelProtocol != expectedPrioritizeTunnelProtocol {
 			unexpectedServerEntryPrioritizeDial.Store(1)
 		}
 		return dslClient.DatastoreHasServerEntry(tag, version)
@@ -298,13 +340,20 @@ func testDSLs(testConfig *testConfig) error {
 	datastoreStoreServerEntryWithCheck := func(
 		packedServerEntryFields protocol.PackedServerEntryFields,
 		source string,
-		prioritizeDial bool) error {
+		prioritizeDial bool,
+		prioritizeReason string,
+		prioritizeTunnelProtocol string) error {
 
 		serverEntryFields, _ := protocol.DecodePackedServerEntryFields(packedServerEntryFields)
 		tag := serverEntryFields.GetTag()
 
-		expectedSource, expectedPrioritizeDial, err := backend.GetServerEntryProperties(tag)
-		if err != nil || prioritizeDial != expectedPrioritizeDial {
+		expectedSource, expectedPrioritizeDial, expectedPrioritizeReason,
+			expectedPrioritizeTunnelProtocol, err :=
+			backend.GetServerEntryProperties(tag)
+		if err != nil ||
+			prioritizeDial != expectedPrioritizeDial ||
+			prioritizeReason != expectedPrioritizeReason ||
+			prioritizeTunnelProtocol != expectedPrioritizeTunnelProtocol {
 			unexpectedServerEntryPrioritizeDial.Store(1)
 		}
 		if err != nil || source != expectedSource {
@@ -436,6 +485,23 @@ func testDSLs(testConfig *testConfig) error {
 	if dslClient.serverEntryStoreCount != backend.GetServerEntryCount(isTunneled) {
 		return errors.Tracef(
 			"unexpected server entry store count: %d", dslClient.serverEntryStoreCount)
+	}
+
+	if testConfig.cacheOSLFileSpecs {
+		if !testConfig.requireOSLKeys {
+			return errors.TraceNew("invalid test config")
+		}
+
+		// Refetch OSL file specs.
+
+		dslClient.lastFetchTime = time.Time{}
+		dslClient.lastActiveOSLsTime = time.Time{}
+		dslClient.oslStates = make(map[string][]byte)
+
+		err = fetcher.Run(ctx)
+		if err != nil {
+			return errors.Trace(err)
+		}
 	}
 
 	if testConfig.requireOSLKeys {

@@ -27,7 +27,9 @@ package psi
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 
@@ -36,6 +38,14 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/buildinfo"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/tun"
+)
+
+// CrashTracebackLevel values configure the amount of Go runtime traceback
+// detail captured in fatal crash output.
+const (
+	CrashTracebackLevelSingle = "single"
+	CrashTracebackLevelAll    = "all"
+	CrashTracebackLevelSystem = "system"
 )
 
 type PsiphonProviderNoticeHandler interface {
@@ -111,6 +121,70 @@ func OldNoticesFilePath(rootDataDirectoryPath string) string {
 // passed to Start() and there are upgrades available.
 func UpgradeDownloadFilePath(rootDataDirectoryPath string) string {
 	return filepath.Join(rootDataDirectoryPath, psiphon.PsiphonDataDirectoryName, psiphon.UpgradeDownloadFilename)
+}
+
+var crashHandlingMutex sync.Mutex
+
+// ConfigureCrashHandling enables Go runtime crash output for the current
+// process and routes it to crashReportPath.
+//
+// Call this after loading the Go shared library and before invoking other
+// tunnel-core operations. The caller owns crashReportPath lifecycle: it should
+// promote or delete any previous contents, and pre-create or truncate the file
+// if it wants a fresh session header or empty sink. ConfigureCrashHandling
+// appends Go runtime crash output to the existing file.
+func ConfigureCrashHandling(crashReportPath string, tracebackLevel string) error {
+	if crashReportPath == "" {
+		return errors.TraceNew("crashReportPath is required")
+	}
+
+	if tracebackLevel == "" {
+		tracebackLevel = CrashTracebackLevelSingle
+	}
+
+	switch tracebackLevel {
+	case CrashTracebackLevelSingle, CrashTracebackLevelAll, CrashTracebackLevelSystem:
+	default:
+		return errors.Tracef("invalid tracebackLevel: %s", tracebackLevel)
+	}
+
+	crashHandlingMutex.Lock()
+	defer crashHandlingMutex.Unlock()
+
+	err := os.MkdirAll(filepath.Dir(crashReportPath), 0700)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	crashOutputFile, err := os.OpenFile(
+		crashReportPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	defer crashOutputFile.Close()
+
+	debug.SetTraceback(tracebackLevel)
+
+	err = debug.SetCrashOutput(crashOutputFile, debug.CrashOptions{})
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	return nil
+}
+
+// ResetCrashHandling disables any previously configured Go runtime crash
+// output for the current process.
+func ResetCrashHandling() error {
+	crashHandlingMutex.Lock()
+	defer crashHandlingMutex.Unlock()
+
+	err := debug.SetCrashOutput(nil, debug.CrashOptions{})
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	return nil
 }
 
 var controllerMutex sync.Mutex
@@ -296,6 +370,17 @@ func NetworkChanged() {
 	}
 }
 
+// AppResumed notifies Psiphon that the host app has resumed from background.
+func AppResumed() {
+
+	controllerMutex.Lock()
+	defer controllerMutex.Unlock()
+
+	if controller != nil {
+		controller.AppResumed()
+	}
+}
+
 // SetDynamicConfig overrides the sponsor ID and authorizations fields set in
 // the config passed to Start. SetDynamicConfig has no effect if no Controller
 // is started.
@@ -345,7 +430,7 @@ func ExportExchangePayload() string {
 // If an import occurs when Psiphon is working to establsh a tunnel, the newly
 // imported server entry is prioritized.
 //
-// The return value indicates a successful import. If the import failed, a a
+// The return value indicates a successful import. If the import failed, a
 // diagnostic notice has been logged.
 func ImportExchangePayload(payload string) bool {
 
@@ -357,6 +442,26 @@ func ImportExchangePayload(payload string) bool {
 	}
 
 	return controller.ImportExchangePayload(payload)
+}
+
+// ImportPushPayload imports a server entry push payload.
+//
+// If an import occurs when Psiphon is working to establsh a tunnel, the
+// imported server entries are prioritized as indicated in the payload.
+//
+// Returns true if the import succeeded and false on any error. Error
+// details are logged to diagnostics. If an import is partially
+// successful, the imported server entries are retained and prioritized.
+func ImportPushPayload(payload []byte) bool {
+
+	controllerMutex.Lock()
+	defer controllerMutex.Unlock()
+
+	if controller == nil {
+		return false
+	}
+
+	return controller.ImportPushPayload(payload)
 }
 
 var sendFeedbackMutex sync.Mutex

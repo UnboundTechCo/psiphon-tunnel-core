@@ -20,6 +20,7 @@
 package psiphon
 
 import (
+	"crypto/subtle"
 	"net"
 	"strings"
 	"sync"
@@ -60,10 +61,24 @@ func NewSocksProxy(
 		}
 		return nil, errors.Trace(err)
 	}
+	socksListener := socks.NewSocksListener(listener)
+	socksListener.SetUsernamePasswordAuthRequired(func(remoteAddr net.Addr) bool {
+		if remoteAddr == nil {
+			return localProxyAuthRequired(config)
+		}
+		return localProxyAuthRequiredForClient(config, remoteAddr.String())
+	})
+	socksListener.SetUsernamePasswordValidator(func(username, password string) bool {
+		if !localProxyAuthRequired(config) {
+			return true
+		}
+		return subtle.ConstantTimeCompare([]byte(username), []byte(config.LocalProxyUsername)) == 1 &&
+			subtle.ConstantTimeCompare([]byte(password), []byte(config.LocalProxyPassword)) == 1
+	})
 	proxy = &SocksProxy{
 		config:                 config,
 		tunneler:               tunneler,
-		listener:               socks.NewSocksListener(listener),
+		listener:               socksListener,
 		serveWaitGroup:         new(sync.WaitGroup),
 		openConns:              common.NewConns[net.Conn](),
 		stopListeningBroadcast: make(chan struct{}),
@@ -88,7 +103,6 @@ func (proxy *SocksProxy) socksConnectionHandler(localConn *socks.SocksConn) (err
 	defer proxy.openConns.Remove(localConn)
 
 	proxy.openConns.Add(localConn)
-
 	// Using downstreamConn so localConn.Close() will be called when remoteConn.Close() is called.
 	// This ensures that the downstream client (e.g., web browser) doesn't keep waiting on the
 	// open connection for data which will never arrive.
@@ -117,6 +131,26 @@ func (proxy *SocksProxy) socksConnectionHandler(localConn *socks.SocksConn) (err
 	LocalProxyRelay(proxy.config, _SOCKS_PROXY_TYPE, localConn, remoteConn)
 
 	return nil
+}
+
+func localProxyAuthRequired(config *Config) bool {
+	return config != nil && config.LocalProxyUsername != "" && config.LocalProxyPassword != ""
+}
+
+func localProxyAuthRequiredForClient(config *Config, remoteAddr string) bool {
+	if !localProxyAuthRequired(config) {
+		return false
+	}
+	return !isLoopbackRemoteAddr(remoteAddr)
+}
+
+func isLoopbackRemoteAddr(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (proxy *SocksProxy) serve() {

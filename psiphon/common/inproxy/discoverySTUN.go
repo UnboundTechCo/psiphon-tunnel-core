@@ -1,4 +1,4 @@
-//go:build PSIPHON_ENABLE_INPROXY
+//go:build !PSIPHON_DISABLE_INPROXY
 
 /*
  * Copyright (c) 2024, Psiphon Inc.
@@ -28,7 +28,7 @@ import (
 
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
-	"github.com/pion/stun"
+	stun "github.com/pion/stun/v3"
 )
 
 // discoverNATMapping and discoverNATFiltering are modifications of:

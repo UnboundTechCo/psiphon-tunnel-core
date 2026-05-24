@@ -68,6 +68,9 @@ var protobufMessageFieldGroups = map[string]protobufFieldGroupConfig{
 	"dsl_relay_get_server_entries": {
 		baseParams: true,
 	},
+	"dsl_relay_get_osl_file_specs": {
+		baseParams: true,
+	},
 }
 
 // NewProtobufRoutedMessage returns a populated Router protobuf message.
@@ -95,7 +98,6 @@ func NewProtobufRoutedMessage(
 	return &pbr.Router{
 		Destination: &destination,
 		MessageType: &messageType,
-		Key:         []byte(logHostID),
 		Value:       serialized,
 	}, nil
 }
@@ -189,7 +191,7 @@ func logFieldsToProtobuf(logFields LogFields) []*pbr.Router {
 						Region:   &regionString,
 					}
 
-					if value, exists := protoStats["server_entry_tag"].(string); exists {
+					if value, exists := logFields["server_entry_tag"].(string); exists {
 						msg.ServerEntryTag = &value
 					}
 
@@ -294,6 +296,10 @@ func logFieldsToProtobuf(logFields LogFields) []*pbr.Router {
 		msg := &pb.DslRelayGetServerEntries{}
 		protobufPopulateMessage(logFields, msg, eventName)
 		psiphondWrapped.Metric = &pb.Psiphond_DslRelayGetServerEntries{DslRelayGetServerEntries: msg}
+	case "dsl_relay_get_osl_file_specs":
+		msg := &pb.DslRelayGetOslFileSpecs{}
+		protobufPopulateMessage(logFields, msg, eventName)
+		psiphondWrapped.Metric = &pb.Psiphond_DslRelayGetOslFileSpecs{DslRelayGetOslFileSpecs: msg}
 	}
 
 	// Single append for all non-special cases.
@@ -662,7 +668,7 @@ func setProtobufSliceField(field reflect.Value, fieldType reflect.StructField, l
 	case inproxy.ICECandidateTypes:
 		newSlice := make([]string, 0, len(sliceValue))
 		for _, elem := range sliceValue {
-			newSlice = append(newSlice, inproxy.PortMappingType(elem).String())
+			newSlice = append(newSlice, inproxy.ICECandidateType(elem).String())
 		}
 
 		field.Set(reflect.ValueOf(newSlice))

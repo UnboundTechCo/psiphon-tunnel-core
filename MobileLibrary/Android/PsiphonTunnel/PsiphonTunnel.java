@@ -48,6 +48,9 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Enumeration;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.CountDownLatch;
@@ -66,6 +69,18 @@ import psi.PsiphonProviderNetwork;
 import psi.PsiphonProviderNoticeHandler;
 
 public class PsiphonTunnel {
+
+    /**
+     * A point-in-time snapshot of per-region proxy activity metrics.
+     * Used in onInproxyProxyActivity
+     */
+    public static class RegionActivitySnapshot {
+        public long bytesUp;
+        public long bytesDown;
+        public int connectingClients;
+        public int connectedClients;
+    }
+
     public interface HostLogger {
         default void onDiagnosticMessage(String message) {}
     }
@@ -140,14 +155,26 @@ public class PsiphonTunnel {
          * @param connectedClients Number of clients currently connected to the proxy.
          * @param bytesUp  Bytes uploaded through the proxy since the last report.
          * @param bytesDown Bytes downloaded through the proxy since the last report.
+         * @param personalRegionActivity Per-region activity metrics for personal proxy clients
+         * @param commonRegionActivity Per-region activity metrics for common proxy clients
          */
         default void onInproxyProxyActivity(
-            int announcing, int connectingClients, int connectedClients,long bytesUp, long bytesDown) {}
+            int announcing, 
+            int connectingClients, 
+            int connectedClients,
+            long bytesUp, 
+            long bytesDown,
+            Map<String, RegionActivitySnapshot> personalRegionActivity,
+            Map<String, RegionActivitySnapshot> commonRegionActivity) {}
         /**
          * Called when tunnel-core reports connected server region information.
          * @param region The server region received.
          */
         default void onConnectedServerRegion(String region) {}
+        /**
+         * Called when a light proxy is available to use even when no tunnel is connected.
+         */
+        default void onLightProxyAvailable() {}
         default void onExiting() {}
     }
 
@@ -253,6 +280,11 @@ public class PsiphonTunnel {
         Psi.reconnectTunnel();
     }
 
+    // Notify Psiphon that the host app has resumed from background.
+    public synchronized void appResumed() {
+        Psi.appResumed();
+    }
+
     public void setClientPlatformAffixes(String prefix, String suffix) {
         mClientPlatformPrefix.set(prefix);
         mClientPlatformSuffix.set(suffix);
@@ -264,6 +296,19 @@ public class PsiphonTunnel {
 
     public boolean importExchangePayload(String payload) {
         return Psi.importExchangePayload(payload);
+    }
+
+    // importPushPayload imports a server entry push payload. If no tunnel is
+    // currently connected, this operation will reset tunnel establishment
+    // with imported server entries prioritized appropriately. The push
+    // payload parameters must be set in the Psiphon config, and Psiphon must
+    // be started.
+    //
+    // Returns true if the import succeeded and false on any error. Error
+    // details are logged to diagnostics. If an import is partially
+    // successful, the imported server entries are retained and prioritized.
+    public boolean importPushPayload(byte[] payload) {
+        return Psi.importPushPayload(payload);
     }
 
     // Writes Go runtime profile information to a set of files in the specifiec output directory.
@@ -283,6 +328,7 @@ public class PsiphonTunnel {
         private final ExecutorService callbackQueue = Executors.newSingleThreadExecutor();
 
         void shutdownAndAwaitTermination(ExecutorService pool) {
+            pool.shutdown();
             try {
                 // Wait a while for existing tasks to terminate
                 if (!pool.awaitTermination(5, TimeUnit.SECONDS)) {
@@ -583,7 +629,7 @@ public class PsiphonTunnel {
         // one has yet replaced it.
 
         String servers = mActiveNetworkDNSServers.get();
-        if (servers != "") {
+        if (!TextUtils.isEmpty(servers)) {
             return servers;
         }
 
@@ -924,12 +970,20 @@ public class PsiphonTunnel {
                 mHostService.onInproxyMustUpgrade();
             } else if (noticeType.equals("InproxyProxyActivity")) {
                 JSONObject data = notice.getJSONObject("data");
+                Map<String, RegionActivitySnapshot> personalRegionActivity =
+                        parseRegionActivity(data.getJSONObject("personalRegionActivity"));
+                Map<String, RegionActivitySnapshot> commonRegionActivity =
+                        parseRegionActivity(data.getJSONObject("commonRegionActivity"));
                 mHostService.onInproxyProxyActivity(
                         data.getInt("announcing"),
                         data.getInt("connectingClients"),
                         data.getInt("connectedClients"),
                         data.getLong("bytesUp"),
-                        data.getLong("bytesDown"));
+                        data.getLong("bytesDown"),
+                        personalRegionActivity,
+                        commonRegionActivity);
+            } else if (noticeType.equals("LightProxyAvailable")) {
+                mHostService.onLightProxyAvailable();
             }
 
             if (diagnostic) {
@@ -940,6 +994,29 @@ public class PsiphonTunnel {
         } catch (JSONException e) {
             // Ignore notice
         }
+    }
+
+    private static Map<String, RegionActivitySnapshot> parseRegionActivity(
+            JSONObject json) throws JSONException {
+        // creates a Map and populates it with the data from all available
+        // regions. This function also makes sure that the map is never null
+        if (json == null) {
+            return Collections.emptyMap();
+        }
+
+        Map<String, RegionActivitySnapshot> result = new HashMap<>();
+        Iterator<String> keys = json.keys();
+        while (keys.hasNext()) {
+            String region = keys.next();
+            JSONObject regionData = json.getJSONObject(region);
+            RegionActivitySnapshot snapshot = new RegionActivitySnapshot();
+            snapshot.bytesUp = regionData.getLong("bytesUp");
+            snapshot.bytesDown = regionData.getLong("bytesDown");
+            snapshot.connectingClients = regionData.getInt("connectingClients");
+            snapshot.connectedClients = regionData.getInt("connectedClients");
+            result.put(region, snapshot);
+        }
+        return result;
     }
 
     private static String getDeviceRegion(Context context) {
@@ -993,12 +1070,7 @@ public class PsiphonTunnel {
 
         ArrayList<String> servers = new ArrayList<>();
         for (InetAddress serverAddress : getActiveNetworkDNSServerAddresses(context, isVpnMode)) {
-            String server = serverAddress.toString();
-            // strip the leading slash e.g., "/192.168.1.1"
-            if (server.startsWith("/")) {
-                server = server.substring(1);
-            }
-            servers.add(server);
+            addUsableDNSServer(servers, serverAddress, null);
         }
 
         if (servers.isEmpty()) {
@@ -1006,6 +1078,36 @@ public class PsiphonTunnel {
         }
 
         return servers;
+    }
+
+    private static void addUsableDNSServer(
+            Collection<String> servers, InetAddress serverAddress, String interfaceName) {
+
+        if (serverAddress == null ||
+                serverAddress.isAnyLocalAddress() ||
+                serverAddress.isMulticastAddress()) {
+            return;
+        }
+
+        String server = serverAddress.getHostAddress();
+
+        // IPv4 link-local is not usable. Append required zone/scope for
+        // link-local IPv6.
+        if (serverAddress.isLinkLocalAddress()) {
+            if (!(serverAddress instanceof Inet6Address)) {
+                return;
+            }
+            if (!server.contains("%")) {
+                if (TextUtils.isEmpty(interfaceName)) {
+                    return;
+                }
+                server = server + "%" + interfaceName;
+            }
+        }
+
+        if (!servers.contains(server)) {
+            servers.add(server);
+        }
     }
 
     private static Collection<InetAddress> getActiveNetworkDNSServerAddresses(Context context, boolean isVpnMode)
@@ -1325,11 +1427,10 @@ public class PsiphonTunnel {
                             if (linkProperties != null) {
                                 List<InetAddress> serverAddresses = linkProperties.getDnsServers();
                                 for (InetAddress serverAddress : serverAddresses) {
-                                    String server = serverAddress.toString();
-                                    if (server.startsWith("/")) {
-                                        server = server.substring(1);
-                                    }
-                                    servers.add(server);
+                                    addUsableDNSServer(
+                                            servers,
+                                            serverAddress,
+                                            linkProperties.getInterfaceName());
                                 }
                             }
                         } catch (java.lang.Exception ignored) {

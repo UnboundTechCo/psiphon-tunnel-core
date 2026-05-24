@@ -147,7 +147,7 @@ func TestDuplicateSessionID(t *testing.T) {
 		t.Fatalf("Commit failed: %s", err)
 	}
 
-	resolver := psiphon.NewResolver(clientConfig, true)
+	resolver := psiphon.NewResolver(clientConfig, nil)
 	defer resolver.Stop()
 	clientConfig.SetResolver(resolver)
 
@@ -174,7 +174,7 @@ func TestDuplicateSessionID(t *testing.T) {
 			nil,
 			nil,
 			func(_ *protocol.ServerEntry, _ string) bool { return false },
-			func(_ *protocol.ServerEntry) (string, bool) { return "OSSH", true },
+			func(_ *protocol.ServerEntry, _ string) (string, bool) { return "OSSH", true },
 			serverEntry,
 			nil,
 			nil,
