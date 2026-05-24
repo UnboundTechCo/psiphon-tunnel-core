@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/parameters"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
 )
 
 func TestFrontedMeekCDNScanBuiltInCandidateSetsValidate(t *testing.T) {
@@ -273,10 +274,9 @@ func TestFrontedMeekCDNScanPreservesOverrideWrapping(t *testing.T) {
 	}
 }
 
-func TestFrontedMeekCDNScanFoundNoticeLogsOnce(t *testing.T) {
+func TestFrontedMeekCDNScanRecordResultDoesNotEmitFoundNotice(t *testing.T) {
 
 	foundNoticeCount := 0
-	foundNoticeMessage := ""
 	err := SetNoticeWriter(NewNoticeReceiver(func(notice []byte) {
 		noticeType, payload, err := GetNotice(notice)
 		if err != nil {
@@ -286,7 +286,6 @@ func TestFrontedMeekCDNScanFoundNoticeLogsOnce(t *testing.T) {
 		message, _ := payload["message"].(string)
 		if noticeType == "Info" && strings.HasPrefix(message, "cdn fronting scan found") {
 			foundNoticeCount += 1
-			foundNoticeMessage = message
 		}
 	}))
 	if err != nil {
@@ -312,10 +311,119 @@ func TestFrontedMeekCDNScanFoundNoticeLogsOnce(t *testing.T) {
 		SNIServerName: "two.example.com",
 	}, true)
 
-	if foundNoticeCount != 1 {
-		t.Fatalf("found notice count = %d, want 1", foundNoticeCount)
+	if foundNoticeCount != 0 {
+		t.Fatalf("found notice count = %d, want 0", foundNoticeCount)
 	}
-	expectedMessage := "cdn fronting scan found (ip: 192\\.0\\.2\\.1, sni: one.example.com)"
+}
+
+func TestFrontedMeekCDNScanFoundNoticeFromDialParams(t *testing.T) {
+
+	foundNoticeMessage := ""
+	err := SetNoticeWriter(NewNoticeReceiver(func(notice []byte) {
+		noticeType, payload, err := GetNotice(notice)
+		if err != nil {
+			t.Errorf("GetNotice failed: %v", err)
+			return
+		}
+		message, _ := payload["message"].(string)
+		if noticeType == "Info" && strings.HasPrefix(message, "cdn fronting scan found") {
+			foundNoticeMessage = message
+		}
+	}))
+	if err != nil {
+		t.Fatalf("SetNoticeWriter failed: %v", err)
+	}
+	defer ResetNoticeWriter()
+
+	dialParams := &DialParameters{
+		FrontedMeekCDNScanCandidate: true,
+		MeekFrontingDialOverrideID:  frontedMeekCDNScanOverrideID,
+		MeekFrontingDialAddress:     "192.0.2.4",
+		MeekSNIServerName:           "",
+		frontedMeekCDNScanSelectedCandidate: parameters.FrontedMeekCDNScanCandidate{
+			IPAddress:     "192.0.2.1",
+			SNIServerName: "selected.example.com",
+		},
+	}
+	if !isFrontedMeekCDNScanDialParams(dialParams) {
+		t.Fatalf("expected scan dial params to be detected as CDN scan dial params")
+	}
+
+	noticeFrontedMeekCDNScanConnected(dialParams)
+
+	expectedMessage := "cdn fronting scan found (ip: 192\\.0\\.2\\.4, sni: none)"
+	if foundNoticeMessage != expectedMessage {
+		t.Fatalf("found notice message = %q, want %q", foundNoticeMessage, expectedMessage)
+	}
+}
+
+func TestFrontedMeekCDNScanFoundNoticeFromReplayDialParams(t *testing.T) {
+
+	foundNoticeMessage := ""
+	err := SetNoticeWriter(NewNoticeReceiver(func(notice []byte) {
+		noticeType, payload, err := GetNotice(notice)
+		if err != nil {
+			t.Errorf("GetNotice failed: %v", err)
+			return
+		}
+		message, _ := payload["message"].(string)
+		if noticeType == "Info" && strings.HasPrefix(message, "cdn fronting scan found") {
+			foundNoticeMessage = message
+		}
+	}))
+	if err != nil {
+		t.Fatalf("SetNoticeWriter failed: %v", err)
+	}
+	defer ResetNoticeWriter()
+
+	dialParams := &DialParameters{
+		MeekFrontingDialOverrideID: frontedMeekCDNScanOverrideID,
+		MeekFrontingDialAddress:    "192.0.2.3",
+		MeekSNIServerName:          "cached.example.com",
+	}
+	if !isFrontedMeekCDNScanDialParams(dialParams) {
+		t.Fatalf("expected replay dial params to be detected as CDN scan dial params")
+	}
+
+	noticeFrontedMeekCDNScanConnected(dialParams)
+
+	expectedMessage := "cdn fronting scan found (ip: 192\\.0\\.2\\.3, sni: cached.example.com)"
+	if foundNoticeMessage != expectedMessage {
+		t.Fatalf("found notice message = %q, want %q", foundNoticeMessage, expectedMessage)
+	}
+}
+
+func TestFrontedMeekCDNScanFoundNoticeFromConnectedCDNProtocol(t *testing.T) {
+
+	foundNoticeMessage := ""
+	err := SetNoticeWriter(NewNoticeReceiver(func(notice []byte) {
+		noticeType, payload, err := GetNotice(notice)
+		if err != nil {
+			t.Errorf("GetNotice failed: %v", err)
+			return
+		}
+		message, _ := payload["message"].(string)
+		if noticeType == "Info" && strings.HasPrefix(message, "cdn fronting scan found") {
+			foundNoticeMessage = message
+		}
+	}))
+	if err != nil {
+		t.Fatalf("SetNoticeWriter failed: %v", err)
+	}
+	defer ResetNoticeWriter()
+
+	dialParams := &DialParameters{
+		TunnelProtocol:          protocol.TUNNEL_PROTOCOL_FRONTED_MEEK_HTTP_CDN,
+		MeekFrontingDialAddress: "203.0.113.9",
+		MeekSNIServerName:       "",
+	}
+	if isFrontedMeekCDNScanDialParams(dialParams) {
+		t.Fatalf("did not expect connected CDN protocol dial params to be scan-marked")
+	}
+
+	noticeFrontedMeekCDNScanConnected(dialParams)
+
+	expectedMessage := "cdn fronting scan found (ip: 203\\.0\\.113\\.9, sni: none)"
 	if foundNoticeMessage != expectedMessage {
 		t.Fatalf("found notice message = %q, want %q", foundNoticeMessage, expectedMessage)
 	}

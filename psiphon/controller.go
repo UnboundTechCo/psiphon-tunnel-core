@@ -1402,6 +1402,7 @@ loop:
 				// Emit notice for non-Conduit protocols
 				NoticeInfo("tunnel connected (protocol: %s)", connectedTunnel.dialParams.TunnelProtocol)
 			}
+			noticeFrontedMeekCDNScanConnected(connectedTunnel.dialParams)
 
 			// Emit beast mode stats when aggressive establishment is active.
 			if controller.config.AggressiveEstablishment && beastModeAttempts > 0 {
@@ -2866,6 +2867,7 @@ func (controller *Controller) launchEstablishing() {
 	}
 	noticeFrontedMeekCDNScanActive(
 		p,
+		controller.config.GetNetworkID(),
 		workerPoolSize,
 		controller.config.AggressiveEstablishment)
 
@@ -3983,7 +3985,7 @@ loop:
 			continue
 		}
 
-		if dialParams.FrontedMeekCDNScanCandidate {
+		if isFrontedMeekCDNScanDialParams(dialParams) {
 			controller.markFrontedMeekCDNScanRouteFound()
 		}
 		recordFrontedMeekCDNScanResult(dialParams, true)

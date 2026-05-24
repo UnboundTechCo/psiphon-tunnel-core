@@ -13,6 +13,7 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/parameters"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
 )
 
 const (
@@ -54,19 +55,21 @@ type frontedMeekCDNScanState struct {
 	attempts            int
 	lastProgressAttempt int
 	exhaustedLogged     bool
-	foundLogged         bool
 }
 
 var frontedMeekCDNScanStates sync.Map
 
 func noticeFrontedMeekCDNScanActive(
 	p parameters.ParametersAccessor,
+	networkID string,
 	workerPoolSize int,
 	aggressive bool) {
 
-	if frontedMeekCDNScanCandidateSetCount(makeFrontedMeekCDNScanCandidateSets(p)) == 0 {
+	candidateSets := makeFrontedMeekCDNScanCandidateSets(p)
+	if frontedMeekCDNScanCandidateSetCount(candidateSets) == 0 {
 		return
 	}
+	getFrontedMeekCDNScanState(networkID, candidateSets).resetEstablishment()
 
 	mode := "normal"
 	if aggressive {
@@ -235,6 +238,39 @@ func recordFrontedMeekCDNScanResult(dialParams *DialParameters, success bool) {
 	state.recordResult(dialParams.frontedMeekCDNScanSelectedCandidate, success)
 }
 
+func isFrontedMeekCDNScanDialParams(dialParams *DialParameters) bool {
+	return dialParams != nil &&
+		(dialParams.FrontedMeekCDNScanCandidate ||
+			dialParams.MeekFrontingDialOverrideID == frontedMeekCDNScanOverrideID)
+}
+
+func frontedMeekCDNScanCandidateFromDialParams(
+	dialParams *DialParameters) parameters.FrontedMeekCDNScanCandidate {
+
+	if dialParams == nil {
+		return parameters.FrontedMeekCDNScanCandidate{}
+	}
+	candidate := parameters.FrontedMeekCDNScanCandidate{
+		IPAddress:     dialParams.MeekFrontingDialAddress,
+		SNIServerName: dialParams.MeekSNIServerName,
+	}
+	if candidate.IPAddress == "" && dialParams.FrontedMeekCDNScanCandidate {
+		return dialParams.frontedMeekCDNScanSelectedCandidate
+	}
+	return candidate
+}
+
+func noticeFrontedMeekCDNScanConnected(dialParams *DialParameters) {
+
+	if dialParams == nil ||
+		(!isFrontedMeekCDNScanDialParams(dialParams) &&
+			!protocol.TunnelProtocolUsesFrontedMeekCDN(dialParams.TunnelProtocol)) {
+		return
+	}
+	noticeFrontedMeekCDNScanFound(
+		frontedMeekCDNScanCandidateFromDialParams(dialParams))
+}
+
 func makeFrontedMeekCDNScanCandidateSets(
 	p parameters.ParametersAccessor) []frontedMeekCDNScanCandidateSet {
 
@@ -387,6 +423,15 @@ func (state *frontedMeekCDNScanState) load() {
 	state.shuffleSeed = record.ShuffleSeed
 }
 
+func (state *frontedMeekCDNScanState) resetEstablishment() {
+	state.mutex.Lock()
+	defer state.mutex.Unlock()
+
+	state.attempts = 0
+	state.lastProgressAttempt = 0
+	state.exhaustedLogged = false
+}
+
 func (state *frontedMeekCDNScanState) candidateHints() (
 	[]parameters.FrontedMeekCDNScanCandidate,
 	map[string]struct{},
@@ -498,27 +543,27 @@ func (state *frontedMeekCDNScanState) recordResult(
 		entry.LastFailureTimestamp = now
 		entry.FailureCount += 1
 	}
-	shouldLogFound := success && !state.foundLogged
-	if shouldLogFound {
-		state.foundLogged = true
-	}
 	jsonCache := state.marshalLocked()
 	state.mutex.Unlock()
-
-	if shouldLogFound {
-		sniServerName := candidate.SNIServerName
-		if sniServerName == "" {
-			sniServerName = "none"
-		}
-		NoticeInfo(
-			"cdn fronting scan found (ip: %s, sni: %s)",
-			common.EscapeRedactIPAddressString(candidate.IPAddress),
-			sniServerName)
-	}
 
 	if jsonCache != nil {
 		_ = SetKeyValue(state.datastoreKey, string(jsonCache))
 	}
+}
+
+func noticeFrontedMeekCDNScanFound(candidate parameters.FrontedMeekCDNScanCandidate) {
+
+	if candidate.IPAddress == "" {
+		return
+	}
+	sniServerName := candidate.SNIServerName
+	if sniServerName == "" {
+		sniServerName = "none"
+	}
+	NoticeInfo(
+		"cdn fronting scan found (ip: %s, sni: %s)",
+		common.EscapeRedactIPAddressString(candidate.IPAddress),
+		sniServerName)
 }
 
 func (state *frontedMeekCDNScanState) marshalLocked() []byte {
