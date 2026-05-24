@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/parameters"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
@@ -505,7 +506,14 @@ func (state *frontedMeekCDNScanState) recordResult(
 	state.mutex.Unlock()
 
 	if shouldLogFound {
-		NoticeInfo("cdn fronting scan found")
+		sniServerName := candidate.SNIServerName
+		if sniServerName == "" {
+			sniServerName = "none"
+		}
+		NoticeInfo(
+			"cdn fronting scan found (ip: %s, sni: %s)",
+			common.EscapeRedactIPAddressString(candidate.IPAddress),
+			sniServerName)
 	}
 
 	if jsonCache != nil {

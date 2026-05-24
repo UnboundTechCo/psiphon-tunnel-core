@@ -3,6 +3,7 @@ package psiphon
 import (
 	"encoding/binary"
 	"net/netip"
+	"strings"
 	"testing"
 
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/parameters"
@@ -275,14 +276,17 @@ func TestFrontedMeekCDNScanPreservesOverrideWrapping(t *testing.T) {
 func TestFrontedMeekCDNScanFoundNoticeLogsOnce(t *testing.T) {
 
 	foundNoticeCount := 0
+	foundNoticeMessage := ""
 	err := SetNoticeWriter(NewNoticeReceiver(func(notice []byte) {
 		noticeType, payload, err := GetNotice(notice)
 		if err != nil {
 			t.Errorf("GetNotice failed: %v", err)
 			return
 		}
-		if noticeType == "Info" && payload["message"] == "cdn fronting scan found" {
+		message, _ := payload["message"].(string)
+		if noticeType == "Info" && strings.HasPrefix(message, "cdn fronting scan found") {
 			foundNoticeCount += 1
+			foundNoticeMessage = message
 		}
 	}))
 	if err != nil {
@@ -310,6 +314,10 @@ func TestFrontedMeekCDNScanFoundNoticeLogsOnce(t *testing.T) {
 
 	if foundNoticeCount != 1 {
 		t.Fatalf("found notice count = %d, want 1", foundNoticeCount)
+	}
+	expectedMessage := "cdn fronting scan found (ip: 192\\.0\\.2\\.1, sni: one.example.com)"
+	if foundNoticeMessage != expectedMessage {
+		t.Fatalf("found notice message = %q, want %q", foundNoticeMessage, expectedMessage)
 	}
 }
 
