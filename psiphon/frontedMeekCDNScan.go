@@ -53,6 +53,7 @@ type frontedMeekCDNScanState struct {
 	attempts            int
 	lastProgressAttempt int
 	exhaustedLogged     bool
+	foundLogged         bool
 }
 
 var frontedMeekCDNScanStates sync.Map
@@ -496,10 +497,14 @@ func (state *frontedMeekCDNScanState) recordResult(
 		entry.LastFailureTimestamp = now
 		entry.FailureCount += 1
 	}
+	shouldLogFound := success && !state.foundLogged
+	if shouldLogFound {
+		state.foundLogged = true
+	}
 	jsonCache := state.marshalLocked()
 	state.mutex.Unlock()
 
-	if success {
+	if shouldLogFound {
 		NoticeInfo("cdn fronting scan found")
 	}
 

@@ -272,6 +272,47 @@ func TestFrontedMeekCDNScanPreservesOverrideWrapping(t *testing.T) {
 	}
 }
 
+func TestFrontedMeekCDNScanFoundNoticeLogsOnce(t *testing.T) {
+
+	foundNoticeCount := 0
+	err := SetNoticeWriter(NewNoticeReceiver(func(notice []byte) {
+		noticeType, payload, err := GetNotice(notice)
+		if err != nil {
+			t.Errorf("GetNotice failed: %v", err)
+			return
+		}
+		if noticeType == "Info" && payload["message"] == "cdn fronting scan found" {
+			foundNoticeCount += 1
+		}
+	}))
+	if err != nil {
+		t.Fatalf("SetNoticeWriter failed: %v", err)
+	}
+	defer ResetNoticeWriter()
+
+	state := &frontedMeekCDNScanState{
+		datastoreKey: "test-fronted-meek-cdn-scan-found-notice",
+		entries:      make(map[string]*frontedMeekCDNScanCacheEntry),
+	}
+
+	state.recordResult(parameters.FrontedMeekCDNScanCandidate{
+		IPAddress:     "192.0.2.1",
+		SNIServerName: "one.example.com",
+	}, true)
+	state.recordResult(parameters.FrontedMeekCDNScanCandidate{
+		IPAddress:     "192.0.2.1",
+		SNIServerName: "one.example.com",
+	}, true)
+	state.recordResult(parameters.FrontedMeekCDNScanCandidate{
+		IPAddress:     "192.0.2.2",
+		SNIServerName: "two.example.com",
+	}, true)
+
+	if foundNoticeCount != 1 {
+		t.Fatalf("found notice count = %d, want 1", foundNoticeCount)
+	}
+}
+
 func testFrontedMeekCDNScanStringSliceContains(values []string, value string) bool {
 	for _, candidate := range values {
 		if candidate == value {
