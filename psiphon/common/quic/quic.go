@@ -884,7 +884,7 @@ func NewQUICTransporter(
 	}
 
 	if isIETFVersionNumber(versionNumber) {
-		t.quicRoundTripper = &http3.RoundTripper{Dial: t.dialIETFQUIC}
+		t.quicRoundTripper = &http3.Transport{Dial: t.dialIETFQUIC}
 	} else {
 		var err error
 		t.quicRoundTripper, err = gQUICRoundTripper(t)
@@ -951,14 +951,14 @@ func (t *QUICTransporter) GetMetrics() common.LogFields {
 }
 
 func (t *QUICTransporter) dialIETFQUIC(
-	_ context.Context, _ string, _ *tls.Config, _ *ietf_quic.Config) (ietf_quic.EarlyConnection, error) {
+	_ context.Context, _ string, _ *tls.Config, _ *ietf_quic.Config) (*ietf_quic.Conn, error) {
 	// quic-go now supports the request context in its RoundTripper.Dial, but
 	// we already handle this via t.ctx, so we ignore the input context.
 	connection, err := t.dialQUIC()
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	return connection.(*ietfQUICConnection).Connection.(ietf_quic.EarlyConnection), nil
+	return connection.(*ietfQUICConnection).Conn, nil
 }
 
 func (t *QUICTransporter) dialQUIC() (retConnection quicConnection, retErr error) {
@@ -1118,7 +1118,7 @@ func (l *ietfQUICListener) Accept() (quicConnection, error) {
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	return &ietfQUICConnection{Connection: connection}, nil
+	return &ietfQUICConnection{Conn: connection}, nil
 }
 
 func (l *ietfQUICListener) Close() error {
@@ -1128,7 +1128,7 @@ func (l *ietfQUICListener) Close() error {
 }
 
 type ietfQUICConnection struct {
-	ietf_quic.Connection
+	*ietf_quic.Conn
 	clientMetrics quicClientConnMetrics
 }
 
@@ -1138,7 +1138,7 @@ func (c *ietfQUICConnection) AcceptStream() (quicStream, error) {
 	//
 	// TODO: once gQUIC support is retired, this context may be used in place
 	// of the deferredAcceptStream mechanism.
-	stream, err := c.Connection.AcceptStream(context.Background())
+	stream, err := c.Conn.AcceptStream(context.Background())
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -1146,11 +1146,11 @@ func (c *ietfQUICConnection) AcceptStream() (quicStream, error) {
 }
 
 func (c *ietfQUICConnection) OpenStream() (quicStream, error) {
-	return c.Connection.OpenStream()
+	return c.Conn.OpenStream()
 }
 
 func (c *ietfQUICConnection) Close() error {
-	return c.Connection.CloseWithError(0, "")
+	return c.Conn.CloseWithError(0, "")
 }
 
 func (c *ietfQUICConnection) isErrorIndicatingClosed(err error) bool {
@@ -1229,7 +1229,7 @@ func dialQUIC(
 			sni = quicSNIAddress
 		}
 
-		var dialConnection ietf_quic.Connection
+		var dialConnection *ietf_quic.Conn
 		tlsConfig := &tls.Config{
 			InsecureSkipVerify:     true,
 			InsecureSkipTimeVerify: true,
@@ -1310,7 +1310,7 @@ func dialQUIC(
 		}
 
 		return &ietfQUICConnection{
-			Connection:    dialConnection,
+			Conn:          dialConnection,
 			clientMetrics: metrics,
 		}, nil
 

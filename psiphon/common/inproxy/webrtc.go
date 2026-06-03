@@ -2646,8 +2646,8 @@ func (conn *mediaTrackPacketConn) SetWriteDeadline(t time.Time) error {
 type reliableConn struct {
 	mediaTrackConn *mediaTrackPacketConn
 	quicTransport  *quic_go.Transport
-	quicConn       quic_go.EarlyConnection
-	quicStream     quic_go.Stream
+	quicConn       *quic_go.Conn
+	quicStream     *quic_go.Stream
 
 	readMutex  sync.Mutex
 	writeMutex sync.Mutex
