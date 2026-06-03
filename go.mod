@@ -1,8 +1,6 @@
 module github.com/Psiphon-Labs/psiphon-tunnel-core
 
-go 1.26.0
-
-toolchain go1.26.3
+go 1.26.3
 
 // The following replaces are required only when the build tag
 // PSIPHON_ENABLE_REFRACTION_NETWORKING is specified.
@@ -13,6 +11,8 @@ replace github.com/pion/dtls/v2 => ./replace/dtls
 
 // pion/dtls v2 uses a local replace (replace/dtls) with [Psiphon] patches
 // for Conjure/refraction-networking support.
+
+replace github.com/Psiphon-Labs/goptlib => ./replace/goptlib
 
 require (
 	filippo.io/edwards25519 v1.2.0
